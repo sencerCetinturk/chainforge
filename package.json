@@ -2,7 +2,7 @@
   "name": "chainforge",
   "displayName": "ChainForge — Multi-Model AI Chat & Agents",
   "description": "AI coding assistant for VS Code. Chat with GPT, Claude, Gemini & 400+ models via OpenRouter. Smart routing, automatic fallback, multi-agent chains.",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "publisher": "sencerCetinturk",
   "license": "MIT",
   "engines": { "vscode": "^1.85.0" },
