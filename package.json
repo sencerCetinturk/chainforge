@@ -1,18 +1,18 @@
 {
   "name": "chainforge",
-  "displayName": "ChainForge",
-  "description": "Multi-model AI orchestration for VS Code. Chain any LLM via OpenRouter with automatic fallback and task routing.",
+  "displayName": "ChainForge — Multi-Model AI Chat & Agents",
+  "description": "AI coding assistant for VS Code. Chat with GPT, Claude, Gemini & 400+ models via OpenRouter. Smart routing, automatic fallback, multi-agent chains.",
   "version": "1.0.1",
   "publisher": "sencerCetinturk",
   "license": "MIT",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["AI", "Other", "Programming Languages"],
-  "keywords": [
-    "ai", "llm", "openrouter", "multi-model", "ai chain",
-    "claude", "gpt", "gemini", "deepseek", "coding assistant",
-    "ai orchestration", "fallback", "agent", "chainforge",
-    "minimax", "glm", "artificial intelligence", "automation"
-  ],
+ "keywords": [
+  "ai", "copilot", "chatgpt", "openrouter", "claude",
+  "llm", "gpt", "gemini", "deepseek", "ai agent",
+  "coding assistant", "multi-model", "ai chain", "ai orchestration",
+  "fallback", "minimax", "glm", "automation"
+],
   "icon": "icon.png",
   "galleryBanner": {
     "color": "#0d1117",
