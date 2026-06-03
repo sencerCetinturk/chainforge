@@ -48,7 +48,7 @@ async function activate(context) {
             return await router.run(prompt, taskType);
         }, () => configManager.openConfigFile(), async (key) => {
             await vscode.workspace.getConfiguration("chainforge").update("openRouterKey", key, vscode.ConfigurationTarget.Global);
-        }, onSaveConfig, onActivateLicense, onDeactivateLicense, currentIsPro, currentLang);
+        }, onSaveConfig, onActivateLicense, onDeactivateLicense, currentIsPro, currentLang, licenseManager.getSavedKey());
     });
     const runTask = vscode.commands.registerCommand("chainforge.runTask", async () => {
         if (!router) {

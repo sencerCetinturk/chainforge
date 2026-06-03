@@ -61,7 +61,8 @@ export async function activate(context: vscode.ExtensionContext) {
       onActivateLicense,
       onDeactivateLicense,
       currentIsPro,
-      currentLang
+      currentLang,
+      licenseManager!.getSavedKey()
     );
   });
 

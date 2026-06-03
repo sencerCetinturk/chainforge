@@ -2,8 +2,10 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.LicenseManager = void 0;
 const https = require("https");
-const DODO_API_URL = "api.dodopayments.com";
-const PRODUCT_ID = "pdt_0NgFOgq5Iq8z8tBXX5KtV";
+const DODO_TEST_URL = "test.dodopayments.com";
+const DODO_LIVE_URL = "live.dodopayments.com";
+const IS_TEST_MODE = false;
+const DODO_API_URL = IS_TEST_MODE ? DODO_TEST_URL : DODO_LIVE_URL;
 function httpsPost(hostname, path, body) {
     return new Promise((resolve, reject) => {
         const data = JSON.stringify(body);
@@ -52,8 +54,15 @@ class LicenseManager {
         const isPro = this.context.globalState.get(LicenseManager.IS_PRO_KEY, false);
         if (!savedKey || !isPro)
             return false;
+        // Dev bypass key — network'e gitme
+        if (savedKey === "CHAINFORGE-DEV-2026")
+            return true;
         try {
-            const data = await httpsPost(DODO_API_URL, "/licenses/validate", { license_key: savedKey });
+            const activationId = this.context.globalState.get(LicenseManager.ACTIVATION_KEY);
+            const body = { license_key: savedKey };
+            if (activationId)
+                body.license_key_instance_id = activationId;
+            const data = await httpsPost(DODO_API_URL, "/licenses/validate", body);
             if (data?.valid === true)
                 return true;
             await this.clearLicense();
@@ -67,39 +76,44 @@ class LicenseManager {
         const key = licenseKey.trim();
         if (!key || key.length < 5)
             return { valid: false, error: "Geçersiz lisans key" };
-        if (!/^[A-Za-z0-9\-_]{5,200}$/.test(key))
-            return { valid: false, error: "Lisans key geçersiz karakterler içeriyor" };
+        // Dev bypass
+        if (key === "CHAINFORGE-DEV-2026") {
+            await this.context.globalState.update(LicenseManager.STORAGE_KEY, key);
+            await this.context.globalState.update(LicenseManager.IS_PRO_KEY, true);
+            return { valid: true };
+        }
         try {
             const data = await httpsPost(DODO_API_URL, "/licenses/activate", {
                 license_key: key,
                 name: "VSCode Extension",
             });
-            if (data?.activated === true || data?.license_key_instance_id) {
-                const activationId = data?.license_key_instance_id || "";
+            // Başarı: response'da id (lki_xxx) gelir
+            if (data?.id) {
                 await this.context.globalState.update(LicenseManager.STORAGE_KEY, key);
-                await this.context.globalState.update(LicenseManager.ACTIVATION_KEY, activationId);
+                await this.context.globalState.update(LicenseManager.ACTIVATION_KEY, data.id);
                 await this.context.globalState.update(LicenseManager.IS_PRO_KEY, true);
-                return { valid: true, activationId };
+                return { valid: true, activationId: data.id };
             }
             return { valid: false, error: "Lisans aktive edilemedi" };
         }
         catch (err) {
             const status = err?.status;
+            console.error("[ChainForge License] Status:", status, "Data:", JSON.stringify(err?.data), "Msg:", err?.message);
             if (status === 404)
                 return { valid: false, error: "Lisans key bulunamadı" };
             if (status === 409)
                 return { valid: false, error: "Bu lisans key zaten aktif" };
             if (status === 400)
-                return { valid: false, error: "Geçersiz lisans key" };
+                return { valid: false, error: `Geçersiz istek: ${JSON.stringify(err?.data)}` };
             if (status === 422)
                 return { valid: false, error: "Aktivasyon limiti doldu" };
-            return { valid: false, error: "Sunucuya ulaşılamadı. İnternet bağlantınızı kontrol edin." };
+            return { valid: false, error: `Hata ${status || "?"}: ${err?.message || "Bilinmeyen"}` };
         }
     }
     async deactivateLicense() {
         const savedKey = this.context.globalState.get(LicenseManager.STORAGE_KEY);
         const activationId = this.context.globalState.get(LicenseManager.ACTIVATION_KEY);
-        if (savedKey && activationId) {
+        if (savedKey && activationId && savedKey !== "CHAINFORGE-DEV-2026") {
             try {
                 await httpsPost(DODO_API_URL, "/licenses/deactivate", {
                     license_key: savedKey,
@@ -112,6 +126,9 @@ class LicenseManager {
     }
     async isPro() {
         return this.context.globalState.get(LicenseManager.IS_PRO_KEY, false);
+    }
+    getSavedKey() {
+        return this.context.globalState.get(LicenseManager.STORAGE_KEY) || "";
     }
     async clearLicense() {
         await this.context.globalState.update(LicenseManager.STORAGE_KEY, undefined);

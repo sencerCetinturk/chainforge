@@ -18,7 +18,8 @@ export class AIChainPanel {
     onActivateLicense: (key: string) => Promise<{ success: boolean; error?: string }>,
     onDeactivateLicense: () => Promise<void>,
     isPro: boolean,
-    lang: string = "en"
+    lang: string = "en",
+    licenseKey: string = ""
   ) {
     const column = vscode.window.activeTextEditor ? vscode.ViewColumn.Beside : undefined;
 
@@ -39,7 +40,7 @@ export class AIChainPanel {
 
     AIChainPanel.currentPanel = new AIChainPanel(
       panel, config, onTask, onOpenConfig, onSaveKey,
-      onSaveConfig, onActivateLicense, onDeactivateLicense, isPro, lang
+      onSaveConfig, onActivateLicense, onDeactivateLicense, isPro, lang, licenseKey
     );
   }
 
@@ -60,7 +61,8 @@ export class AIChainPanel {
     private onActivateLicense: (key: string) => Promise<{ success: boolean; error?: string }>,
     private onDeactivateLicense: () => Promise<void>,
     private isPro: boolean,
-    private lang: string = "en"
+    private lang: string = "en",
+    private licenseKey: string = ""
   ) {
     this.panel = panel;
     this.nonce = this.generateNonce();
@@ -68,7 +70,6 @@ export class AIChainPanel {
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
 
     this.panel.webview.onDidReceiveMessage(async (message) => {
-      // Her mesaj tipi için strict tip kontrolü
       if (!message || typeof message.command !== "string") return;
 
       switch (message.command) {
@@ -98,7 +99,7 @@ export class AIChainPanel {
         }
         case "openUrl": {
           if (typeof message.url !== "string") return;
-          const allowed = ["openrouter.ai", "dodopayments.com", "test.checkout.dodopayments.com", "dodo.pe"];
+          const allowed = ["openrouter.ai", "dodopayments.com", "checkout.dodopayments.com", "dodo.pe"];
           try {
             const u = new URL(message.url);
             if (allowed.some(d => u.hostname === d || u.hostname.endsWith("." + d))) {
@@ -196,10 +197,18 @@ export class AIChainPanel {
           break;
         }
         case "deactivateLicense": {
-          await this.onDeactivateLicense();
-          this.isPro = false;
-          this.update();
-          this.panel.webview.postMessage({ command: "licenseDeactivated" });
+          const answer = await vscode.window.showWarningMessage(
+            "Lisansı iptal etmek istediğinizden emin misiniz?\nBu lisans yalnızca 1 cihazda kullanılabilir. İptal ettiğinizde Pro özellikler devre dışı kalır.",
+            { modal: true },
+            "Evet, İptal Et"
+          );
+          if (answer === "Evet, İptal Et") {
+            await this.onDeactivateLicense();
+            this.isPro = false;
+            this.licenseKey = "";
+            this.update();
+            this.panel.webview.postMessage({ command: "licenseDeactivated" });
+          }
           break;
         }
       }
@@ -290,9 +299,9 @@ export class AIChainPanel {
       .replace(/'/g, "&#x27;");
   }
 
-  private getAgentCards(): string {
+  private getAgentCards(t: (key: string) => string): string {
     if (!this.config?.agents || Object.keys(this.config.agents).length === 0) {
-      return "<p class='empty'>Henüz agent yok. Yeni Agent butonuna tıklayın.</p>";
+      return `<p class='empty'>${t('agentsEmpty')}</p>`;
     }
     const roleColors: Record<string, string> = {
       routing: "#f59e0b", math: "#10b981", coding: "#3b82f6",
@@ -316,16 +325,16 @@ export class AIChainPanel {
           </div>
           ${safeFallback ? `<div class="card-fallback">→ ${safeFallback}</div>` : ""}
           <div class="card-actions">
-            <button class="btn-sm edit-agent-btn" data-key="${safeKey}">Düzenle</button>
-            <button class="btn-sm btn-danger delete-agent-btn" data-key="${safeKey}">Sil</button>
+            <button class="btn-sm edit-agent-btn" data-key="${safeKey}">${t('editBtn')}</button>
+            <button class="btn-sm btn-danger delete-agent-btn" data-key="${safeKey}">${t('deleteBtn')}</button>
           </div>
         </div>`;
     }).join("");
   }
 
-  private getTaskCards(): string {
+  private getTaskCards(t: (key: string) => string): string {
     if (!this.config?.tasks || Object.keys(this.config.tasks).length === 0) {
-      return "<p class='empty'>Henüz görev yok. Yeni Görev butonuna tıklayın.</p>";
+      return `<p class='empty'>${t('tasksEmpty')}</p>`;
     }
     return Object.entries(this.config.tasks).map(([key, task]) => {
       const agent = this.config!.agents[task.primary];
@@ -342,8 +351,8 @@ export class AIChainPanel {
             <span class="badge" style="background:#3b82f620;color:#3b82f6">${safeAgent}</span>
           </div>
           <div class="card-actions">
-            <button class="btn-sm edit-task-btn" data-key="${safeKey}">Düzenle</button>
-            <button class="btn-sm btn-danger delete-task-btn" data-key="${safeKey}">Sil</button>
+            <button class="btn-sm edit-task-btn" data-key="${safeKey}">${t('editBtn')}</button>
+            <button class="btn-sm btn-danger delete-task-btn" data-key="${safeKey}">${t('deleteBtn')}</button>
           </div>
         </div>`;
     }).join("");
@@ -376,8 +385,24 @@ export class AIChainPanel {
       `<option value="${code}" ${code === lang ? "selected" : ""}>${name}</option>`
     ).join("");
 
+    // Script içinde kullanılacak çevirileri JSON olarak inject et
+    const i18nJson = JSON.stringify({
+      noResult: t('noResult'),
+      running: t('running'),
+      keyEmpty: t('keyEmpty') || "Key boş olamaz",
+      deactivateConfirm: t('deactivateConfirm'),
+      agentDeleteConfirm: t('agentDeleteConfirm') || "agent silinsin mi?",
+      taskDeleteConfirm: t('taskDeleteConfirm') || "görevi silinsin mi?",
+      agentFieldsRequired: t('agentFieldsRequired') || "Key, isim ve model zorunludur",
+      taskFieldsRequired: t('taskFieldsRequired') || "Tüm alanlar zorunludur",
+      filenameEmpty: t('filenameEmpty') || "Dosya adı boş olamaz",
+      filenameInvalid: t('filenameInvalid') || "Geçersiz dosya adı",
+      keySaved: t('keySaved'),
+      unknownError: t('unknownError') || "Bilinmeyen hata",
+    });
+
     return `<!DOCTYPE html>
-<html lang="tr">
+<html lang="${lang}">
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline';">
@@ -463,143 +488,149 @@ a{color:var(--vscode-textLink-foreground)}
   <button class="tab" id="tab-settings">${t('tabSettings')}</button>
 </div>
 
-<!-- ÇALIŞTIR -->
+<!-- RUN TAB -->
 <div class="tab-content active" id="content-run">
-  <div class="sec-label">Görev Tipi</div>
+  <div class="sec-label">${t('taskType')}</div>
   <select id="taskType">${this.getTaskOptions()}</select>
 
-  <label for="prompt">Prompt</label>
-  <textarea id="prompt" placeholder="Görevinizi yazın... (Enter = gönder, Shift+Enter = yeni satır)"></textarea>
+  <label for="prompt">${t('prompt')}</label>
+  <textarea id="prompt" placeholder="${t('promptPlaceholder') || ''}"></textarea>
 
   <div class="btn-row">
-    <button id="btnRun">▶ Çalıştır</button>
-    <button id="btnClear" class="btn-sec">Temizle</button>
+    <button id="btnRun">${t('btnRun')}</button>
+    <button id="btnClear" class="btn-sec">${t('btnClear')}</button>
   </div>
 
   <div class="divider"></div>
 
-  <div class="sec-label">Sonuç</div>
-  <div class="result-box" id="result">Henüz sonuç yok.</div>
+  <div class="sec-label">${t('result')}</div>
+  <div class="result-box" id="result">${t('noResult')}</div>
   <div class="meta-row" id="meta" style="display:none">
-    <span>🤖 <b id="metaAgent"></b></span>
-    <span>📦 <span id="metaModel"></span></span>
-    <span>🔄 <span id="metaAttempts"></span></span>
+    <span>${t('agentLabel')} <b id="metaAgent"></b></span>
+    <span>${t('modelLabel')} <span id="metaModel"></span></span>
+    <span>${t('chainLabel')} <span id="metaAttempts"></span></span>
   </div>
   <div class="btn-row" id="saveRow" style="display:none">
-    <button id="btnShowSave">💾 Dosyaya Kaydet</button>
+    <button id="btnShowSave">${t('saveFile')}</button>
   </div>
 </div>
 
-<!-- AGENTLAR -->
+<!-- AGENTS TAB -->
 <div class="tab-content" id="content-agents">
-  <div class="sec-label">Mevcut Agentlar</div>
-  <div class="cards-grid" id="agentCards">${this.getAgentCards()}</div>
-  ${atLimit ? `<p class="limit-note">⚠ Ücretsiz sürümde max ${freeLimit} agent. Pro'ya geçerek sınırsız agent ekleyebilirsiniz.</p>` : ""}
-  <button id="btnNewAgent" ${atLimit ? "disabled" : ""}>+ Yeni Agent</button>
+  <div class="sec-label">${t('agentsTitle')}</div>
+  <div class="cards-grid" id="agentCards">${this.getAgentCards(t)}</div>
+  ${atLimit ? `<p class="limit-note">⚠ ${t('limitNote')}</p>` : ""}
+  <button id="btnNewAgent" ${atLimit ? "disabled" : ""}>${t('newAgent')}</button>
   <div id="agentErr" class="err-msg"></div>
 </div>
 
-<!-- GÖREVLER -->
+<!-- TASKS TAB -->
 <div class="tab-content" id="content-tasks">
-  <div class="sec-label">Mevcut Görevler</div>
-  <div class="cards-grid" id="taskCards">${this.getTaskCards()}</div>
-  <button id="btnNewTask">+ Yeni Görev</button>
+  <div class="sec-label">${t('tasksTitle')}</div>
+  <div class="cards-grid" id="taskCards">${this.getTaskCards(t)}</div>
+  <button id="btnNewTask">${t('newTask')}</button>
   <div id="taskErr" class="err-msg"></div>
 </div>
 
-<!-- AYARLAR -->
+<!-- SETTINGS TAB -->
 <div class="tab-content" id="content-settings">
-  <div class="sec-label">OpenRouter API Key</div>
+  <div class="sec-label">${t('settingsKey')}</div>
   <div class="key-row">
     <input type="password" id="apiKey" placeholder="sk-or-..." autocomplete="off" />
-    <button id="btnSaveKey">Kaydet</button>
+    <button id="btnSaveKey">${t('btnSaveKey')}</button>
   </div>
   <div id="keyErr" class="err-msg"></div>
-  <div id="keyOk" class="ok-msg">✓ Key kaydedildi</div>
+  <div id="keyOk" class="ok-msg">✓ ${t('keySaved')}</div>
   <p style="font-size:11px;color:var(--vscode-descriptionForeground);margin-top:6px">
-    Ücretsiz key: <a id="linkOpenRouter" href="#">openrouter.ai</a>
+    ${t('freeKey')} <a id="linkOpenRouter" href="#">openrouter.ai</a>
   </p>
 
   ${this.isPro ? `
   <div class="divider"></div>
-  <div class="sec-label">Pro Lisans</div>
-  <div style="font-size:12px;color:var(--vscode-descriptionForeground);margin-bottom:8px">Aktif lisansınız mevcut.</div>
-  <button id="btnDeactivate" class="btn-danger btn-sec">Lisansı İptal Et</button>
+  <div class="sec-label">${t('proLicenseTitle') || 'Pro License'}</div>
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+    <div style="flex:1;background:var(--vscode-input-background);border:1px solid var(--vscode-input-border);border-radius:4px;padding:6px 10px;font-size:12px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+      ${this.licenseKey ? this.licenseKey.slice(0,4) + "••••••••••••" + this.licenseKey.slice(-4) : "••••••••••••"}
+    </div>
+    <button id="btnCopyKey" class="btn-sec" style="flex-shrink:0;font-size:11px" data-key="${this.escapeHtml(this.licenseKey)}">📋 Kopyala</button>
+  </div>
+  <div id="copyOk" class="ok-msg">✓ Kopyalandı</div>
+  <button id="btnDeactivate" class="btn-danger btn-sec">${t('deactivate')}</button>
   ` : ""}
 
   <div class="divider"></div>
-  <div class="sec-label">Gelişmiş</div>
-  <button id="btnOpenConfig" class="btn-sec">📄 JSON Config Düzenle</button>
+  <div class="sec-label">${t('advanced')}</div>
+  <button id="btnOpenConfig" class="btn-sec">${t('editConfig')}</button>
 </div>
 
 <!-- AGENT MODAL -->
 <div class="modal-overlay" id="agentModal">
   <div class="modal">
-    <div class="modal-title" id="agentModalTitle">Yeni Agent</div>
-    <label>Anahtar (key) *</label>
-    <input id="agentKey" placeholder="ornek: ue5_uzman" maxlength="50" autocomplete="off" />
-    <label>İsim *</label>
-    <input id="agentName" placeholder="UE5 Uzmanı" maxlength="100" />
-    <label>Model * <span style="font-size:10px;color:var(--vscode-descriptionForeground)">(provider/model-adi)</span></label>
-    <input id="agentModel" placeholder="minimax/minimax-m3" maxlength="100" autocomplete="off" />
+    <div class="modal-title" id="agentModalTitle">${t('agentNew')}</div>
+    <label>${t('agentKey')}</label>
+    <input id="agentKey" placeholder="${t('agentKeyPlaceholder')}" maxlength="50" autocomplete="off" />
+    <label>${t('agentName')}</label>
+    <input id="agentName" placeholder="${t('agentNamePlaceholder')}" maxlength="100" />
+    <label>${t('agentModel')} <span style="font-size:10px;color:var(--vscode-descriptionForeground)">(provider/model-name)</span></label>
+    <input id="agentModel" placeholder="${t('agentModelPlaceholder')}" maxlength="100" autocomplete="off" />
     <p style="font-size:10px;color:var(--vscode-descriptionForeground);margin-top:3px">
-      Modeller: <a id="linkModels" href="#">openrouter.ai/models</a>
+      ${t('models')} <a id="linkModels" href="#">openrouter.ai/models</a>
     </p>
-    <label>Rol</label>
+    <label>${t('agentRole')}</label>
     <select id="agentRole">
-      <option value="coding">coding — Kod yazma</option>
-      <option value="math">math — Matematik/mantık</option>
-      <option value="routing">routing — Görev yönlendirme</option>
-      <option value="long-coding">long-coding — Uzun görevler</option>
-      <option value="fallback">fallback — Yedek</option>
-      <option value="supervisor">supervisor — Denetmen</option>
-      <option value="custom">custom — Özel</option>
+      <option value="coding">coding</option>
+      <option value="math">math</option>
+      <option value="routing">routing</option>
+      <option value="long-coding">long-coding</option>
+      <option value="fallback">fallback</option>
+      <option value="supervisor">supervisor</option>
+      <option value="custom">custom</option>
     </select>
-    <label>Fallback Agent</label>
+    <label>${t('agentFallback')}</label>
     <select id="agentFallback">
-      <option value="">— Yok —</option>
+      <option value="">${t('noFallback')}</option>
       ${this.getAgentOptions()}
     </select>
-    <label>Max Deneme (1-5)</label>
+    <label>${t('agentRetries')}</label>
     <input id="agentRetries" type="number" value="2" min="1" max="5" />
-    <label>Sistem Promptu <span style="font-size:10px">(opsiyonel, max 2000 karakter)</span></label>
-    <textarea id="agentSystemPrompt" placeholder="Sen deneyimli bir UE5 geliştiricisisin..." maxlength="2000"></textarea>
+    <label>${t('agentPrompt')}</label>
+    <textarea id="agentSystemPrompt" placeholder="${t('agentPromptPlaceholder')}" maxlength="2000"></textarea>
     <div id="agentModalErr" class="err-msg" style="margin-top:8px"></div>
     <div class="btn-row">
-      <button id="btnSaveAgent">Kaydet</button>
-      <button id="btnCancelAgent" class="btn-sec">İptal</button>
+      <button id="btnSaveAgent">${t('saveBtn')}</button>
+      <button id="btnCancelAgent" class="btn-sec">${t('cancelBtn')}</button>
     </div>
   </div>
 </div>
 
-<!-- GÖREV MODAL -->
+<!-- TASK MODAL -->
 <div class="modal-overlay" id="taskModal">
   <div class="modal">
-    <div class="modal-title" id="taskModalTitle">Yeni Görev</div>
-    <label>Anahtar (key) *</label>
-    <input id="taskKey" placeholder="ornek: ue5_kodlama" maxlength="50" autocomplete="off" />
-    <label>Açıklama *</label>
-    <input id="taskDescription" placeholder="UE5 C++ geliştirme" maxlength="200" />
-    <label>Primary Agent *</label>
+    <div class="modal-title" id="taskModalTitle">${t('taskNew')}</div>
+    <label>${t('taskKey')}</label>
+    <input id="taskKey" placeholder="${t('taskKeyPlaceholder')}" maxlength="50" autocomplete="off" />
+    <label>${t('taskDesc')}</label>
+    <input id="taskDescription" placeholder="${t('taskDescPlaceholder')}" maxlength="200" />
+    <label>${t('taskPrimary')}</label>
     <select id="taskPrimary">${this.getAgentOptions()}</select>
     <div id="taskModalErr" class="err-msg" style="margin-top:8px"></div>
     <div class="btn-row">
-      <button id="btnSaveTask">Kaydet</button>
-      <button id="btnCancelTask" class="btn-sec">İptal</button>
+      <button id="btnSaveTask">${t('saveBtn')}</button>
+      <button id="btnCancelTask" class="btn-sec">${t('cancelBtn')}</button>
     </div>
   </div>
 </div>
 
-<!-- DOSYA KAYDET MODAL -->
+<!-- SAVE FILE MODAL -->
 <div class="modal-overlay" id="saveModal">
   <div class="modal">
-    <div class="modal-title">Dosyaya Kaydet</div>
-    <label>Dosya adı</label>
+    <div class="modal-title">${t('saveFile')}</div>
+    <label>${t('filenameLabel')}</label>
     <input id="saveFilename" placeholder="output.ts" maxlength="100" />
     <div id="saveErr" class="err-msg" style="margin-top:6px"></div>
     <div class="btn-row">
-      <button id="btnDoSave">Kaydet</button>
-      <button id="btnCancelSave" class="btn-sec">İptal</button>
+      <button id="btnDoSave">${t('saveBtn')}</button>
+      <button id="btnCancelSave" class="btn-sec">${t('cancelBtn')}</button>
     </div>
   </div>
 </div>
@@ -607,171 +638,206 @@ a{color:var(--vscode-textLink-foreground)}
 <!-- PRO MODAL -->
 <div class="modal-overlay" id="proModal">
   <div class="modal">
-    <div class="modal-title">⭐ AI Chain Pro — $9.99</div>
+    <div class="modal-title">${t('proTitle')}</div>
     <div class="pro-box">
       <div style="font-size:12px;line-height:1.8">
-        ✓ Sınırsız agent ekleme (ücretsiz: 3)<br>
-        ✓ Her provider için ayrı API key<br>
-        ✓ Gelişmiş fallback zinciri<br>
-        ✓ Tüm gelecek güncellemeler<br>
-        ✓ Tek seferlik ödeme, abonelik yok
+        ${t('proFeature1')}<br>
+        ${t('proFeature2')}<br>
+        ${t('proFeature3')}<br>
+        ${t('proFeature4')}<br>
+        ${t('proFeature5')}
       </div>
     </div>
     <div style="margin-bottom:12px">
       <button id="btnBuyPro" style="width:100%;background:#f59e0b;color:#000;font-weight:600;padding:10px">
-        Satın Al — $9.99
+        ${t('buyBtn')}
       </button>
     </div>
     <div class="divider"></div>
-    <label>Lisans Key (satın aldıysanız)</label>
-    <input id="licenseKey" placeholder="Lisans key'inizi girin" maxlength="100" autocomplete="off" />
+    <label>${t('licenseKey')}</label>
+    <input id="licenseKey" placeholder="${t('licenseKeyPlaceholder')}" maxlength="100" autocomplete="off" />
     <div id="licenseErr" class="err-msg" style="margin-top:6px"></div>
-    <div id="licenseLoading" style="display:none;font-size:11px;color:var(--vscode-descriptionForeground);margin-top:6px">⏳ Doğrulanıyor...</div>
+    <div id="licenseLoading" style="display:none;font-size:11px;color:var(--vscode-descriptionForeground);margin-top:6px">⏳ ${t('verifying') || 'Verifying...'}</div>
     <div class="btn-row">
-      <button id="btnActivate">Aktive Et</button>
-      <button id="btnCancelPro" class="btn-sec">İptal</button>
+      <button id="btnActivate">${t('activateBtn')}</button>
+      <button id="btnCancelPro" class="btn-sec">${t('cancelBtn')}</button>
     </div>
   </div>
 </div>
 
 <script>
 (function() {
-  const vscode = acquireVsCodeApi();
-  let agents = JSON.parse(atob('${agentsJson}'));
-  let tasks = JSON.parse(atob('${tasksJson}'));
-  let lastResult = "";
-  let editingAgentKey = null;
-  let editingTaskKey = null;
+  var vscode = acquireVsCodeApi();
+  var agents = JSON.parse(atob('${agentsJson}'));
+  var tasks = JSON.parse(atob('${tasksJson}'));
+  var i18n = ${i18nJson};
+  var lastResult = "";
+  var editingAgentKey = null;
+  var editingTaskKey = null;
 
-  // Tab switching
   // Dil değiştirme
-  document.getElementById('langSelect')?.addEventListener('change', (e) => {
-    const lang = (e.target as HTMLSelectElement).value;
-    vscode.postMessage({ command: 'changeLang', lang });
+  document.getElementById('langSelect').addEventListener('change', function(e) {
+    vscode.postMessage({ command: 'changeLang', lang: e.target.value });
   });
 
-  ['run','agents','tasks','settings'].forEach(name => {
-    document.getElementById('tab-' + name)?.addEventListener('click', () => {
-      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-      document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-      document.getElementById('tab-' + name)?.classList.add('active');
-      document.getElementById('content-' + name)?.classList.add('active');
+  // Tab switching
+  ['run','agents','tasks','settings'].forEach(function(name) {
+    var btn = document.getElementById('tab-' + name);
+    if (btn) btn.addEventListener('click', function() {
+      document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+      document.querySelectorAll('.tab-content').forEach(function(t) { t.classList.remove('active'); });
+      document.getElementById('tab-' + name).classList.add('active');
+      document.getElementById('content-' + name).classList.add('active');
     });
   });
 
-  // Çalıştır
-  document.getElementById('btnRun')?.addEventListener('click', runTask);
-  document.getElementById('btnClear')?.addEventListener('click', () => {
-    document.getElementById('result').textContent = 'Henüz sonuç yok.';
+  // Run
+  var btnRun = document.getElementById('btnRun');
+  if (btnRun) btnRun.addEventListener('click', runTask);
+
+  var btnClear = document.getElementById('btnClear');
+  if (btnClear) btnClear.addEventListener('click', function() {
+    document.getElementById('result').textContent = i18n.noResult;
     document.getElementById('meta').style.display = 'none';
     document.getElementById('saveRow').style.display = 'none';
     lastResult = '';
   });
-  document.getElementById('prompt')?.addEventListener('keydown', e => {
+
+  var promptEl = document.getElementById('prompt');
+  if (promptEl) promptEl.addEventListener('keydown', function(e) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runTask(); }
   });
 
   function runTask() {
-    const prompt = document.getElementById('prompt').value.trim();
-    const taskType = document.getElementById('taskType').value;
+    var prompt = document.getElementById('prompt').value.trim();
+    var taskType = document.getElementById('taskType').value;
     if (!prompt) return;
-    document.getElementById('result').innerHTML = '<span class="loading">⏳ Zincir çalışıyor...</span>';
+    document.getElementById('result').innerHTML = '<span class="loading">⏳ ' + i18n.running + '</span>';
     document.getElementById('meta').style.display = 'none';
     document.getElementById('saveRow').style.display = 'none';
-    vscode.postMessage({ command: 'runTask', prompt, taskType });
+    vscode.postMessage({ command: 'runTask', prompt: prompt, taskType: taskType });
   }
 
-  // Ayarlar
-  document.getElementById('btnSaveKey')?.addEventListener('click', () => {
-    const key = document.getElementById('apiKey').value.trim();
+  // Settings
+  var btnSaveKey = document.getElementById('btnSaveKey');
+  if (btnSaveKey) btnSaveKey.addEventListener('click', function() {
+    var key = document.getElementById('apiKey').value.trim();
     showErr('keyErr', '');
     showOk('keyOk', '');
-    if (!key) { showErr('keyErr', 'Key boş olamaz'); return; }
-    vscode.postMessage({ command: 'saveKey', key });
+    if (!key) { showErr('keyErr', i18n.keyEmpty); return; }
+    vscode.postMessage({ command: 'saveKey', key: key });
   });
 
-  document.getElementById('btnOpenConfig')?.addEventListener('click', () => {
+  var btnOpenConfig = document.getElementById('btnOpenConfig');
+  if (btnOpenConfig) btnOpenConfig.addEventListener('click', function() {
     vscode.postMessage({ command: 'openConfig' });
   });
 
-  document.getElementById('btnDeactivate')?.addEventListener('click', () => {
-    if (confirm('Lisansı iptal etmek istiyor musunuz? Pro özellikler devre dışı kalacak.')) {
-      vscode.postMessage({ command: 'deactivateLicense' });
-    }
+  var btnCopyKey = document.getElementById('btnCopyKey');
+  if (btnCopyKey) btnCopyKey.addEventListener('click', function() {
+    var key = btnCopyKey.dataset.key || '';
+    if (!key) return;
+    navigator.clipboard.writeText(key).then(function() {
+      showOk('copyOk', '✓ Kopyalandı');
+      setTimeout(function() { showOk('copyOk', ''); }, 2000);
+    });
   });
 
-  // Linkler
-  document.getElementById('linkOpenRouter')?.addEventListener('click', e => {
+  var btnDeactivate = document.getElementById('btnDeactivate');
+  if (btnDeactivate) btnDeactivate.addEventListener('click', function() {
+    vscode.postMessage({ command: 'deactivateLicense' });
+  });
+
+  // Links
+  var linkOR = document.getElementById('linkOpenRouter');
+  if (linkOR) linkOR.addEventListener('click', function(e) {
     e.preventDefault();
     vscode.postMessage({ command: 'openUrl', url: 'https://openrouter.ai/keys' });
   });
-  document.getElementById('linkModels')?.addEventListener('click', e => {
+  var linkModels = document.getElementById('linkModels');
+  if (linkModels) linkModels.addEventListener('click', function(e) {
     e.preventDefault();
     vscode.postMessage({ command: 'openUrl', url: 'https://openrouter.ai/models' });
   });
 
-  // Agent işlemleri
-  document.getElementById('btnNewAgent')?.addEventListener('click', () => openAgentModal(null));
+  // Agent operations
+  var btnNewAgent = document.getElementById('btnNewAgent');
+  if (btnNewAgent) btnNewAgent.addEventListener('click', function() { openAgentModal(null); });
 
-  document.getElementById('agentCards')?.addEventListener('click', e => {
-    const editBtn = e.target.closest('.edit-agent-btn');
-    const delBtn = e.target.closest('.delete-agent-btn');
+  var agentCards = document.getElementById('agentCards');
+  if (agentCards) agentCards.addEventListener('click', function(e) {
+    var editBtn = e.target.closest('.edit-agent-btn');
+    var delBtn = e.target.closest('.delete-agent-btn');
     if (editBtn) openAgentModal(editBtn.dataset.key);
     if (delBtn) deleteAgent(delBtn.dataset.key);
   });
 
-  document.getElementById('btnSaveAgent')?.addEventListener('click', saveAgent);
-  document.getElementById('btnCancelAgent')?.addEventListener('click', () => closeModal('agentModal'));
+  var btnSaveAgent = document.getElementById('btnSaveAgent');
+  if (btnSaveAgent) btnSaveAgent.addEventListener('click', saveAgent);
+  var btnCancelAgent = document.getElementById('btnCancelAgent');
+  if (btnCancelAgent) btnCancelAgent.addEventListener('click', function() { closeModal('agentModal'); });
 
-  // Görev işlemleri
-  document.getElementById('btnNewTask')?.addEventListener('click', () => openTaskModal(null));
+  // Task operations
+  var btnNewTask = document.getElementById('btnNewTask');
+  if (btnNewTask) btnNewTask.addEventListener('click', function() { openTaskModal(null); });
 
-  document.getElementById('taskCards')?.addEventListener('click', e => {
-    const editBtn = e.target.closest('.edit-task-btn');
-    const delBtn = e.target.closest('.delete-task-btn');
+  var taskCards = document.getElementById('taskCards');
+  if (taskCards) taskCards.addEventListener('click', function(e) {
+    var editBtn = e.target.closest('.edit-task-btn');
+    var delBtn = e.target.closest('.delete-task-btn');
     if (editBtn) openTaskModal(editBtn.dataset.key);
     if (delBtn) deleteTask(delBtn.dataset.key);
   });
 
-  document.getElementById('btnSaveTask')?.addEventListener('click', saveTask);
-  document.getElementById('btnCancelTask')?.addEventListener('click', () => closeModal('taskModal'));
+  var btnSaveTask = document.getElementById('btnSaveTask');
+  if (btnSaveTask) btnSaveTask.addEventListener('click', saveTask);
+  var btnCancelTask = document.getElementById('btnCancelTask');
+  if (btnCancelTask) btnCancelTask.addEventListener('click', function() { closeModal('taskModal'); });
 
-  // Dosya kaydet
-  document.getElementById('btnShowSave')?.addEventListener('click', () => {
+  // Save file
+  var btnShowSave = document.getElementById('btnShowSave');
+  if (btnShowSave) btnShowSave.addEventListener('click', function() {
     document.getElementById('saveFilename').value = guessFilename(lastResult);
     openModal('saveModal');
   });
-  document.getElementById('btnDoSave')?.addEventListener('click', () => {
-    const filename = document.getElementById('saveFilename').value.trim();
+  var btnDoSave = document.getElementById('btnDoSave');
+  if (btnDoSave) btnDoSave.addEventListener('click', function() {
+    var filename = document.getElementById('saveFilename').value.trim();
     showErr('saveErr', '');
-    if (!filename) { showErr('saveErr', 'Dosya adı boş olamaz'); return; }
-    if (!/^[a-zA-Z0-9_\\-\\.]{1,100}$/.test(filename)) { showErr('saveErr', 'Geçersiz dosya adı'); return; }
-    vscode.postMessage({ command: 'saveFile', content: lastResult, filename });
+    if (!filename) { showErr('saveErr', i18n.filenameEmpty); return; }
+    if (!/^[a-zA-Z0-9_.-]{1,100}$/.test(filename)) { showErr('saveErr', i18n.filenameInvalid); return; }
+    vscode.postMessage({ command: 'saveFile', content: lastResult, filename: filename });
     closeModal('saveModal');
   });
-  document.getElementById('btnCancelSave')?.addEventListener('click', () => closeModal('saveModal'));
+  var btnCancelSave = document.getElementById('btnCancelSave');
+  if (btnCancelSave) btnCancelSave.addEventListener('click', function() { closeModal('saveModal'); });
 
   // Pro modal
-  document.getElementById('btnShowPro')?.addEventListener('click', () => openModal('proModal'));
-  document.getElementById('btnCancelPro')?.addEventListener('click', () => closeModal('proModal'));
-  document.getElementById('btnBuyPro')?.addEventListener('click', () => {
-    vscode.postMessage({ command: 'openUrl', url: 'https://test.checkout.dodopayments.com/buy/pdt_0NgFOgq5Iq8z8tBXX5KtV' });
+  var btnShowPro = document.getElementById('btnShowPro');
+  if (btnShowPro) btnShowPro.addEventListener('click', function() { openModal('proModal'); });
+  var btnCancelPro = document.getElementById('btnCancelPro');
+  if (btnCancelPro) btnCancelPro.addEventListener('click', function() { closeModal('proModal'); });
+  var btnBuyPro = document.getElementById('btnBuyPro');
+  if (btnBuyPro) btnBuyPro.addEventListener('click', function() {
+    vscode.postMessage({ command: 'openUrl', url: 'https://checkout.dodopayments.com/buy/pdt_0NgH0yzoqvbfRJzcI6m3F' });
   });
-  document.getElementById('btnActivate')?.addEventListener('click', () => {
-    const key = document.getElementById('licenseKey').value.trim();
+  var btnActivate = document.getElementById('btnActivate');
+  if (btnActivate) btnActivate.addEventListener('click', function() {
+    var key = document.getElementById('licenseKey').value.trim();
     showErr('licenseErr', '');
-    if (!key) { showErr('licenseErr', 'Key boş olamaz'); return; }
-    vscode.postMessage({ command: 'activateLicense', key });
+    if (!key) { showErr('licenseErr', i18n.keyEmpty); return; }
+    vscode.postMessage({ command: 'activateLicense', key: key });
   });
 
-  // Modal fonksiyonları
+  // Modal functions
   function openAgentModal(key) {
     editingAgentKey = key;
-    document.getElementById('agentModalTitle').textContent = key ? 'Agent Düzenle' : 'Yeni Agent';
+    var titleEl = document.getElementById('agentModalTitle');
+    if (titleEl) titleEl.textContent = key ? '${t('agentEdit')}' : '${t('agentNew')}';
     document.getElementById('agentKey').disabled = !!key;
     showErr('agentModalErr', '');
     if (key && agents[key]) {
-      const a = agents[key];
+      var a = agents[key];
       document.getElementById('agentKey').value = key;
       document.getElementById('agentName').value = a.name || '';
       document.getElementById('agentModel').value = a.model || '';
@@ -793,7 +859,7 @@ a{color:var(--vscode-textLink-foreground)}
 
   function saveAgent() {
     showErr('agentModalErr', '');
-    const data = {
+    var data = {
       key: document.getElementById('agentKey').value.trim(),
       name: document.getElementById('agentName').value.trim(),
       model: document.getElementById('agentModel').value.trim(),
@@ -803,21 +869,22 @@ a{color:var(--vscode-textLink-foreground)}
       systemPrompt: document.getElementById('agentSystemPrompt').value,
     };
     if (!data.key || !data.name || !data.model) {
-      showErr('agentModalErr', 'Key, isim ve model zorunludur');
+      showErr('agentModalErr', i18n.agentFieldsRequired);
       return;
     }
     vscode.postMessage({ command: 'saveAgent', isEdit: !!editingAgentKey, agent: data });
   }
 
   function deleteAgent(key) {
-    if (confirm('"' + key + '" agent silinsin mi?')) {
-      vscode.postMessage({ command: 'deleteAgent', key });
+    if (confirm('"' + key + '" ' + i18n.agentDeleteConfirm)) {
+      vscode.postMessage({ command: 'deleteAgent', key: key });
     }
   }
 
   function openTaskModal(key) {
     editingTaskKey = key;
-    document.getElementById('taskModalTitle').textContent = key ? 'Görev Düzenle' : 'Yeni Görev';
+    var titleEl = document.getElementById('taskModalTitle');
+    if (titleEl) titleEl.textContent = key ? '${t('taskEdit')}' : '${t('taskNew')}';
     document.getElementById('taskKey').disabled = !!key;
     showErr('taskModalErr', '');
     if (key && tasks[key]) {
@@ -833,36 +900,36 @@ a{color:var(--vscode-textLink-foreground)}
 
   function saveTask() {
     showErr('taskModalErr', '');
-    const data = {
+    var data = {
       key: document.getElementById('taskKey').value.trim(),
       description: document.getElementById('taskDescription').value.trim(),
       primary: document.getElementById('taskPrimary').value,
     };
     if (!data.key || !data.description || !data.primary) {
-      showErr('taskModalErr', 'Tüm alanlar zorunludur');
+      showErr('taskModalErr', i18n.taskFieldsRequired);
       return;
     }
     vscode.postMessage({ command: 'saveTask', isEdit: !!editingTaskKey, task: data });
   }
 
   function deleteTask(key) {
-    if (confirm('"' + key + '" görevi silinsin mi?')) {
-      vscode.postMessage({ command: 'deleteTask', key });
+    if (confirm('"' + key + '" ' + i18n.taskDeleteConfirm)) {
+      vscode.postMessage({ command: 'deleteTask', key: key });
     }
   }
 
-  function openModal(id) { document.getElementById(id)?.classList.add('open'); }
-  function closeModal(id) { document.getElementById(id)?.classList.remove('open'); }
+  function openModal(id) { var el = document.getElementById(id); if (el) el.classList.add('open'); }
+  function closeModal(id) { var el = document.getElementById(id); if (el) el.classList.remove('open'); }
 
   function showErr(id, msg) {
-    const el = document.getElementById(id);
+    var el = document.getElementById(id);
     if (!el) return;
     el.textContent = msg;
     el.style.display = msg ? 'block' : 'none';
   }
 
   function showOk(id, msg) {
-    const el = document.getElementById(id);
+    var el = document.getElementById(id);
     if (!el) return;
     el.textContent = msg;
     el.style.display = msg ? 'block' : 'none';
@@ -878,17 +945,17 @@ a{color:var(--vscode-textLink-foreground)}
     return 'output.txt';
   }
 
-  // Mesaj dinleyici
-  window.addEventListener('message', e => {
-    const msg = e.data;
-    if (!msg?.command) return;
+  // Message listener
+  window.addEventListener('message', function(e) {
+    var msg = e.data;
+    if (!msg || !msg.command) return;
 
     switch(msg.command) {
       case 'loading':
-        document.getElementById('result').innerHTML = '<span class="loading">⏳ Zincir çalışıyor...</span>';
+        document.getElementById('result').innerHTML = '<span class="loading">⏳ ' + i18n.running + '</span>';
         break;
       case 'result':
-        if (msg.data?.success) {
+        if (msg.data && msg.data.success) {
           lastResult = msg.data.content;
           document.getElementById('result').textContent = msg.data.content;
           document.getElementById('metaAgent').textContent = msg.data.usedAgent || '';
@@ -897,28 +964,28 @@ a{color:var(--vscode-textLink-foreground)}
           document.getElementById('meta').style.display = 'flex';
           document.getElementById('saveRow').style.display = 'flex';
         } else {
-          document.getElementById('result').textContent = '❌ ' + (msg.data?.error || 'Bilinmeyen hata');
+          document.getElementById('result').textContent = '❌ ' + ((msg.data && msg.data.error) || i18n.unknownError);
         }
         break;
       case 'agentSaved':
         closeModal('agentModal');
         break;
       case 'agentError':
-        showErr('agentModalErr', msg.error || 'Hata');
-        showErr('agentErr', msg.error || 'Hata');
+        showErr('agentModalErr', msg.error || 'Error');
+        showErr('agentErr', msg.error || 'Error');
         break;
       case 'taskSaved':
         closeModal('taskModal');
         break;
       case 'taskError':
-        showErr('taskModalErr', msg.error || 'Hata');
+        showErr('taskModalErr', msg.error || 'Error');
         break;
       case 'keyError':
-        showErr('keyErr', msg.error || 'Hata');
+        showErr('keyErr', msg.error || 'Error');
         break;
       case 'keySaved':
-        showOk('keyOk', '✓ Key kaydedildi');
-        setTimeout(() => showOk('keyOk', ''), 3000);
+        showOk('keyOk', '✓ ' + i18n.keySaved);
+        setTimeout(function() { showOk('keyOk', ''); }, 3000);
         break;
       case 'licenseLoading':
         document.getElementById('licenseLoading').style.display = 'block';
@@ -930,7 +997,7 @@ a{color:var(--vscode-textLink-foreground)}
       case 'licenseError':
         document.getElementById('licenseLoading').style.display = 'none';
         document.getElementById('btnActivate').disabled = false;
-        showErr('licenseErr', msg.error || 'Aktivasyon başarısız');
+        showErr('licenseErr', msg.error || 'Error');
         break;
       case 'licenseDeactivated':
         break;
