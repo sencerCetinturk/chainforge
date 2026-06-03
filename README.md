@@ -91,7 +91,7 @@ ChainForge stores configuration in `.chainforge.json` in your workspace root.
 | Multi-provider API keys | — | ✓ |
 | Priority support | — | ✓ |
 
-[**Get Pro — $9.99 one-time →**](https://dodo.pe/3w5oczdscvf)
+[**Get Pro — $9.99 one-time →**](https://dodo.pe/yahnyvd3ig)
 
 ---
 
