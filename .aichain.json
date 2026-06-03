@@ -1,0 +1,42 @@
+{
+  "version": "1.0",
+  "openRouterKey": "",
+  "agents": {
+    "worker": {
+      "name": "AI Worker",
+      "model": "minimax/minimax-m3",
+      "role": "coding",
+      "fallback": "fallback",
+      "maxRetries": 3,
+      "systemPrompt": "You are an expert software developer. Write clean, efficient, well-documented code."
+    },
+    "fallback": {
+      "name": "Fallback",
+      "model": "google/gemini-flash-1-5",
+      "role": "fallback",
+      "fallback": "supervisor",
+      "maxRetries": 2
+    },
+    "supervisor": {
+      "name": "Supervisor",
+      "model": "anthropic/claude-sonnet-4-5",
+      "role": "supervisor",
+      "maxRetries": 1,
+      "systemPrompt": "You are a senior software architect. Review and improve code quality."
+    }
+  },
+  "tasks": {
+    "coding": {
+      "primary": "worker",
+      "description": "Code writing, editing, refactor"
+    },
+    "review": {
+      "primary": "supervisor",
+      "description": "Code review, architecture"
+    },
+    "general": {
+      "primary": "worker",
+      "description": "General questions"
+    }
+  }
+}
