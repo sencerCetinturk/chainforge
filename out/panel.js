@@ -796,7 +796,7 @@ a{color:var(--vscode-textLink-foreground)}
   if (btnCancelPro) btnCancelPro.addEventListener('click', function() { closeModal('proModal'); });
   var btnBuyPro = document.getElementById('btnBuyPro');
   if (btnBuyPro) btnBuyPro.addEventListener('click', function() {
-    vscode.postMessage({ command: 'openUrl', url: 'https://checkout.dodopayments.com/buy/pdt_0NgGp8lGbk3BPTNqjwgPP' });
+    vscode.postMessage({ command: 'openUrl', url: 'https://checkout.dodopayments.com/buy/pdt_0NgH0yzoqvbfRJzcI6m3F' });
   });
   var btnActivate = document.getElementById('btnActivate');
   if (btnActivate) btnActivate.addEventListener('click', function() {

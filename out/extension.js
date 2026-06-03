@@ -7,17 +7,26 @@ const router_1 = require("./router");
 const configManager_1 = require("./configManager");
 const panel_1 = require("./panel");
 const license_1 = require("./license");
+class ChainForgeViewProvider {
+    getTreeItem(element) {
+        return element;
+    }
+    getChildren() {
+        const openItem = new vscode.TreeItem("⛓ Open ChainForge Panel");
+        openItem.command = {
+            command: "chainforge.openPanel",
+            title: "Open ChainForge Panel"
+        };
+        openItem.tooltip = "Click to open ChainForge";
+        return [openItem];
+    }
+}
 let router = null;
 let configManager = null;
 let licenseManager = null;
 async function activate(context) {
     configManager = new configManager_1.ConfigManager(context);
     licenseManager = new license_1.LicenseManager(context);
-    let config = await configManager.loadConfig();
-    if (config)
-        router = new router_1.AIRouter(config);
-    const isPro = await licenseManager.checkSavedLicense();
-    // Dil ayarını oku
     const getLang = () => {
         const lang = vscode.workspace.getConfiguration("chainforge").get("language") || "en";
         return lang;
@@ -36,6 +45,7 @@ async function activate(context) {
     const onDeactivateLicense = async () => {
         await licenseManager.deactivateLicense();
     };
+    // Komutları HEMEN kaydet — async beklemeden
     const openPanel = vscode.commands.registerCommand("chainforge.openPanel", async () => {
         const currentConfig = await configManager.loadConfig();
         const currentIsPro = await licenseManager.isPro();
@@ -94,7 +104,15 @@ async function activate(context) {
         }
         catch { }
     });
-    context.subscriptions.push(openPanel, runTask, configure, openUrl);
+    // TreeView kaydet
+    const viewProvider = new ChainForgeViewProvider();
+    context.subscriptions.push(openPanel, runTask, configure, openUrl, vscode.window.registerTreeDataProvider("chainforgeView", viewProvider));
+    // Async başlatma — komutlar zaten kayıtlı, bu beklenebilir
+    configManager.loadConfig().then(config => {
+        if (config)
+            router = new router_1.AIRouter(config);
+    });
+    licenseManager.checkSavedLicense();
     vscode.workspace.onDidChangeConfiguration(async (e) => {
         if (e.affectsConfiguration("chainforge")) {
             const newConfig = await configManager.loadConfig();

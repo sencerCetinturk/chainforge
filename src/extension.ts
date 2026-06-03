@@ -5,6 +5,22 @@ import { AIChainPanel } from "./panel";
 import { LicenseManager } from "./license";
 import { Language } from "./i18n";
 
+class ChainForgeViewProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+  getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+    return element;
+  }
+
+  getChildren(): vscode.TreeItem[] {
+    const openItem = new vscode.TreeItem("⛓ Open ChainForge Panel");
+    openItem.command = {
+      command: "chainforge.openPanel",
+      title: "Open ChainForge Panel"
+    };
+    openItem.tooltip = "Click to open ChainForge";
+    return [openItem];
+  }
+}
+
 let router: AIRouter | null = null;
 let configManager: ConfigManager | null = null;
 let licenseManager: LicenseManager | null = null;
@@ -13,12 +29,6 @@ export async function activate(context: vscode.ExtensionContext) {
   configManager = new ConfigManager(context);
   licenseManager = new LicenseManager(context);
 
-  let config = await configManager.loadConfig();
-  if (config) router = new AIRouter(config);
-
-  const isPro = await licenseManager.checkSavedLicense();
-
-  // Dil ayarını oku
   const getLang = (): Language => {
     const lang = vscode.workspace.getConfiguration("chainforge").get<string>("language") || "en";
     return lang as Language;
@@ -39,6 +49,7 @@ export async function activate(context: vscode.ExtensionContext) {
     await licenseManager!.deactivateLicense();
   };
 
+  // Komutları HEMEN kaydet — async beklemeden
   const openPanel = vscode.commands.registerCommand("chainforge.openPanel", async () => {
     const currentConfig = await configManager!.loadConfig();
     const currentIsPro = await licenseManager!.isPro();
@@ -111,7 +122,19 @@ export async function activate(context: vscode.ExtensionContext) {
     } catch {}
   });
 
-  context.subscriptions.push(openPanel, runTask, configure, openUrl);
+  // TreeView kaydet
+  const viewProvider = new ChainForgeViewProvider();
+  context.subscriptions.push(
+    openPanel, runTask, configure, openUrl,
+    vscode.window.registerTreeDataProvider("chainforgeView", viewProvider)
+  );
+
+  // Async başlatma — komutlar zaten kayıtlı, bu beklenebilir
+  configManager.loadConfig().then(config => {
+    if (config) router = new AIRouter(config);
+  });
+
+  licenseManager.checkSavedLicense();
 
   vscode.workspace.onDidChangeConfiguration(async (e) => {
     if (e.affectsConfiguration("chainforge")) {

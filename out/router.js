@@ -1,8 +1,52 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AIRouter = void 0;
-const axios_1 = require("axios");
+const https = require("https");
 const validator_1 = require("./validator");
+// Native HTTPS POST — axios bağımlılığını kaldırır (VSIX paketleme sorunu çözümü)
+function httpsPostJson(url, body, headers, timeoutMs) {
+    return new Promise((resolve, reject) => {
+        const u = new URL(url);
+        const payload = JSON.stringify(body);
+        const options = {
+            hostname: u.hostname,
+            path: u.pathname + u.search,
+            method: "POST",
+            headers: {
+                ...headers,
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(payload),
+            },
+        };
+        const req = https.request(options, (res) => {
+            let raw = "";
+            res.on("data", (chunk) => { raw += chunk; });
+            res.on("end", () => {
+                const status = res.statusCode || 0;
+                let data = null;
+                try {
+                    data = raw ? JSON.parse(raw) : null;
+                }
+                catch {
+                    data = raw;
+                }
+                if (status >= 400) {
+                    // axios benzeri hata objesi — mevcut error handling status'a bakıyor
+                    const err = new Error(data?.error?.message || data?.message || `HTTP ${status}`);
+                    err.response = { status, data };
+                    reject(err);
+                }
+                else {
+                    resolve({ status, data });
+                }
+            });
+        });
+        req.on("error", reject);
+        req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error("İstek zaman aşımına uğradı")); });
+        req.write(payload);
+        req.end();
+    });
+}
 class AIRouter {
     constructor(config) {
         this.OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
@@ -95,15 +139,11 @@ class AIRouter {
             messages.push({ role: "system", content: agent.systemPrompt.trim() });
         }
         messages.push({ role: "user", content: prompt });
-        const response = await axios_1.default.post(this.OPENROUTER_URL, { model: agent.model, messages, max_tokens: 4096 }, {
-            headers: {
-                Authorization: `Bearer ${this.config.openRouterKey}`,
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/sencerCetinturk/ai-chain",
-                "X-Title": "AI Chain VSCode Extension",
-            },
-            timeout: 120000,
-        });
+        const response = await httpsPostJson(this.OPENROUTER_URL, { model: agent.model, messages, max_tokens: 4096 }, {
+            Authorization: `Bearer ${this.config.openRouterKey}`,
+            "HTTP-Referer": "https://github.com/sencerCetinturk/chainforge",
+            "X-Title": "ChainForge VSCode Extension",
+        }, 120000);
         const content = response.data?.choices?.[0]?.message?.content;
         if (!content)
             throw new Error("Model boş yanıt döndürdü");

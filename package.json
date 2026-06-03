@@ -2,8 +2,9 @@
   "name": "chainforge",
   "displayName": "ChainForge",
   "description": "Multi-model AI orchestration for VS Code. Chain any LLM via OpenRouter with automatic fallback and task routing.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "sencerCetinturk",
+  "license": "MIT",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["AI", "Other", "Programming Languages"],
   "keywords": [
@@ -13,19 +14,60 @@
     "minimax", "glm", "artificial intelligence", "automation"
   ],
   "icon": "icon.png",
+  "galleryBanner": {
+    "color": "#0d1117",
+    "theme": "dark"
+  },
+  "homepage": "https://github.com/sencerCetinturk/chainforge",
+  "bugs": {
+    "url": "https://github.com/sencerCetinturk/chainforge/issues",
+    "email": "sencercetinturk19@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sencerCetinturk/chainforge.git"
+  },
   "activationEvents": [
     "*",
-    "onCommand:chainforge.openPanel",
-    "onCommand:chainforge.runTask",
-    "onCommand:chainforge.configure"
+    "onView:chainforgeView"
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "chainforge",
+          "title": "ChainForge",
+          "icon": "icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "chainforge": [
+        {
+          "id": "chainforgeView",
+          "name": "ChainForge"
+        }
+      ]
+    },
     "commands": [
-      { "command": "chainforge.openPanel", "title": "ChainForge: Open Panel" },
+      {
+        "command": "chainforge.openPanel",
+        "title": "ChainForge: Open Panel",
+        "icon": "icon.svg"
+      },
       { "command": "chainforge.runTask", "title": "ChainForge: Run Task" },
       { "command": "chainforge.configure", "title": "ChainForge: Configure" }
     ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "chainforge.openPanel",
+          "group": "navigation",
+          "when": "true"
+        }
+      ]
+    },
     "configuration": {
       "title": "ChainForge",
       "properties": {
@@ -47,19 +89,12 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p ./", 
+    "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./"
   },
-  "repository": {
-  "type": "git",
-  "url": "https://github.com/sencerCetinturk/chainforge.git"
-},
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.0.0"
-  },
-  "dependencies": {
-    "axios": "^1.6.0"
   }
 }
