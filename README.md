@@ -88,8 +88,8 @@ ChainForge stores configuration in `.chainforge.json` in your workspace root.
 | Tasks | Unlimited | Unlimited |
 | Visual editor | ✓ | ✓ |
 | File export | ✓ | ✓ |
-| Multi-provider API keys | — | ✓ |
-| Priority support | — | ✓ |
+| Auto fallback chains | ✓ | ✓ |
+| All future updates | — | ✓ |
 
 [**Get Pro — $9.99 one-time →**](https://dodo.pe/yahnyvd3ig)
 
@@ -97,7 +97,7 @@ ChainForge stores configuration in `.chainforge.json` in your workspace root.
 
 ## 🤝 Contributing
 
-Issues and PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+Issues and PRs welcome on [GitHub](https://github.com/sencerCetinturk/chainforge/issues).
 
 ## 📄 License
 
