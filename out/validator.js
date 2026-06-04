@@ -15,7 +15,8 @@ exports.sanitizeString = sanitizeString;
 exports.validateFallback = validateFallback;
 exports.validateFilename = validateFilename;
 // İzin verilen OpenRouter model formatı: "provider/model-name"
-const ALLOWED_MODEL_PATTERN = /^[a-zA-Z0-9_\-]+\/[a-zA-Z0-9_\-\.]+$/;
+// [provider/]model[:suffix] — provider opsiyonel (native model adları için), :free/:online ekleri desteklenir
+const ALLOWED_MODEL_PATTERN = /^[a-zA-Z0-9_\-]+(\/[a-zA-Z0-9_\-\.]+)?(:[a-zA-Z0-9\-]+)?$/;
 // İzin verilen key formatı: sadece harf, rakam, tire, alt çizgi
 const SAFE_KEY_PATTERN = /^[a-zA-Z0-9_\-]{1,50}$/;
 // İzin verilen roller

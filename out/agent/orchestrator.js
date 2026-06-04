@@ -9,10 +9,12 @@ exports.Orchestrator = void 0;
 // 4. Tüm bilgi + dosya içerikleriyle kod yazan AI'ya promptu verir
 // 5. AI yanıtını FileChange[] olarak parse eder
 class Orchestrator {
-    constructor(router, scanner, log, postmanModel) {
+    constructor(router, scanner, log, postmanModel, changeLogger // Geçmiş farkındalığı için
+    ) {
         this.router = router;
         this.scanner = scanner;
         this.log = log;
+        this.changeLogger = changeLogger;
         // Config'de routing rolünde agent varsa onun modelini öne al
         const routingAgent = this.router.findAgentByRole("routing");
         const cfg = this.router.getConfig();
@@ -42,45 +44,37 @@ class Orchestrator {
     async run(userPrompt, codingTaskType) {
         const knowledge = [];
         // --- 1. Workspace tara ---
-        this.log("📂 Workspace taranıyor...");
         const allFiles = await this.scanner.scanAll();
         const relevant = this.scanner.rankByRelevance(allFiles, userPrompt, 15);
-        this.log(`   ${allFiles.length} dosya bulundu, ${relevant.length} alakalı.`);
-        // --- 2. Planlama (POSTACI = ücretsiz model) ---
-        this.log(`🧭 Postacı planlıyor...`);
+        // --- 2. Planlama (ücretsiz model) ---
         const plan = await this.makePlan(userPrompt, relevant, allFiles);
-        this.log(`   Hedef dosyalar: ${plan.targetFiles.join(", ") || "(yeni)"}`);
-        if (plan.needsResearch)
-            this.log("   🔍 Araştırma gerekli.");
-        if (plan.needsMath)
-            this.log("   🔢 Matematik/uzman gerekli.");
-        // --- 3a. Araştırma (POSTACI ücretsiz model + web :online) ---
+        this.log(`Plan: ${plan.targetFiles.join(", ") || "yeni dosya"}`);
+        // --- 3a. Araştırma (gerekirse) ---
         if (plan.needsResearch) {
-            this.log("🔍 Postacı web araştırması yapıyor...");
             const q = plan.searchQuery || userPrompt;
             const res = await this.postmanCall("Sen bir araştırmacısın. Güncel, doğru ve özet bilgi topla.", `Şu konuda güncel bilgi topla:\n${q}`, true);
             if (res.success) {
                 knowledge.push({ source: "research", agentKey: "postman", model: res.model, content: res.content });
-                this.log(`   ✓ ${res.content.length} karakter bilgi toplandı (${res.model}).`);
-            }
-            else {
-                this.log(`   ⚠ Araştırma başarısız: ${res.error}`);
+                this.log(`Araştırma tamamlandı`);
             }
         }
-        // --- 3b. Matematik/uzman (özel AI — sadece görev verilir, dosya görmez) ---
+        // --- 3b. Matematik/uzman (gerekirse) ---
+        // "math" rolü tanımlıysa o uzmana sor. Tanımlı DEĞİLSE iş coding agent'a devredilir
+        // (kod yazan AI hesaplamayı da kendi yapar). Denetmen (supervisor) burada KULLANILMAZ.
+        let codingExtra = "";
         if (plan.needsMath) {
-            const mathAgent = this.router.findAgentByRole("math") || this.router.findAgentByRole("supervisor");
+            const mathAgent = this.router.findAgentByRole("math");
             if (mathAgent) {
-                const mathModel = this.router.getConfig().agents[mathAgent]?.model || "?";
-                this.log(`🔢 Uzman AI'dan görüş alınıyor (${mathModel})...`);
                 const res = await this.router.runFromAgent(mathAgent, `Şu görev için gerekli matematik/fizik/mantık hesaplarını yap, sonuçları net ver:\n${userPrompt}`);
                 if (res.success) {
                     knowledge.push({ source: "math", agentKey: res.usedAgent, model: res.usedModel, content: res.content });
-                    this.log(`   ✓ Uzman bilgisi alındı.`);
+                    this.log(`Uzman görüşü alındı`);
                 }
             }
             else {
-                this.log("   ⚠ Matematik rolünde AI tanımlı değil, atlanıyor.");
+                // math rolü yok → görevi kod yazan AI üstlenir
+                codingExtra += "\n\n[EK GÖREV] Bu iş matematik/hesaplama gerektiriyor ama uzman tanımlı değil. Gerekli tüm hesapları KENDİN yap, doğrula ve koda doğru şekilde yansıt.";
+                this.log("Hesaplama, kod yazan AI'ya devredildi");
             }
         }
         // --- 4. İlgili dosya içeriklerini oku ---
@@ -90,6 +84,19 @@ class Orchestrator {
             if (content !== null)
                 fileContents.push({ path: fp, content });
         }
+        // --- 4b. GEÇMİŞ FARKINDALIĞI: bu dosyalarda daha önce yapılan değişiklikleri oku ---
+        let historyContext = "";
+        if (this.changeLogger && plan.targetFiles.length > 0) {
+            const past = await this.changeLogger.getRecentForFiles(plan.targetFiles, 2);
+            if (past.length > 0) {
+                this.log(`Hafıza: ${past.length} önceki değişiklik dikkate alınıyor`);
+                historyContext = "\n=== BU DOSYALARDA ÖNCEKİ DEĞİŞİKLİKLER (hafıza) ===\n";
+                for (const p of past) {
+                    historyContext += `[${p.timestamp}] ${p.filePath}: ${p.intent} (+${p.linesAdded}/-${p.linesRemoved} satır)\n`;
+                }
+                historyContext += "Bu geçmişi dikkate al — önceki çalışmayı tekrar bozma, tutarlı devam et.\n";
+            }
+        }
         // --- 5. Postacı, uzman kod AI'sına görevi iletir (AI dosya görmez, sadece kod üretir) ---
         const task = this.router.getConfig().tasks[codingTaskType];
         const codingStart = task?.primary || this.router.findAgentByRole("coding");
@@ -97,22 +104,22 @@ class Orchestrator {
             return { success: false, error: "Kod yazacak agent bulunamadı", knowledge, changes: [], codingAgent: "", codingModel: "", attempts: [] };
         }
         const codingModel = this.router.getConfig().agents[codingStart]?.model || "?";
-        this.log(`✏️  Postacı, kod görevini uzman AI'ya iletiyor (${codingModel})...`);
+        this.log(`Kod üretiliyor (${codingModel})…`);
         // Agent'ın rolünü al ve promptu rolüne göre özelleştir
         const codingAgent = this.router.getConfig().agents[codingStart];
         const agentRole = codingAgent?.role || "coding";
-        const codingPrompt = this.buildCodingPrompt(userPrompt, plan, knowledge, fileContents, agentRole);
+        const codingPrompt = this.buildCodingPrompt(userPrompt, plan, knowledge, fileContents, agentRole) + historyContext + codingExtra;
         const codeRes = await this.router.runFromAgent(codingStart, codingPrompt);
         if (!codeRes.success) {
             return { success: false, error: codeRes.error, knowledge, changes: [], codingAgent: codeRes.usedAgent, codingModel: codeRes.usedModel, attempts: codeRes.attempts };
         }
-        // --- 6. POSTACI yanıtı parse eder (dosya yazımı postacının işi, AI'nın değil) ---
+        // --- 6. Yanıt parse edilir (dosya yazımı asistanın işi) ---
         const changes = this.parseChanges(codeRes.content, fileContents);
         if (changes.length === 0) {
-            this.log(`\n⚠ Uzman AI yanıtı parse edilemedi. Ham yanıt:\n${"─".repeat(50)}\n${codeRes.content}\n${"─".repeat(50)}`);
+            this.log(`Yanıt işlenemedi — model beklenen formatı kullanmadı.`);
         }
         else {
-            this.log(`   ✓ Postacı ${changes.length} dosya değişikliği hazırladı (uzman: ${codeRes.usedModel}).`);
+            this.log(`${changes.length} dosya hazırlandı`);
         }
         return {
             success: true,

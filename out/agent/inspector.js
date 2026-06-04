@@ -107,7 +107,7 @@ class Inspector {
         const lastCheck = forceFull ? null : await this.getLastInspectionTime();
         if (!lastCheck) {
             // İLK ÇALIŞTIRMA — tüm dosyaları analiz et
-            this.log(`🔎 Denetmen ilk kez çalışıyor — ${codeFiles.length} dosya analiz edilecek...`);
+            this.log(`${codeFiles.length} dosya taranıyor…`);
             for (const f of codeFiles) {
                 const content = await this.scanner.readFile(f.path);
                 if (content !== null)
@@ -117,31 +117,20 @@ class Inspector {
         else {
             // İNKREMENTAL — dosya sistemi mtime + loglara göre değişenleri bul
             const lastCheckMs = new Date(lastCheck).getTime();
-            this.log(`🔎 Denetmen inkremental — son rapor: ${lastCheck}`);
             const changedPaths = new Set();
-            // Kaynak 1: DOSYA SİSTEMİ — mtime'ı son rapordan yeni olanlar
             for (const f of codeFiles) {
-                if (f.mtime > lastCheckMs) {
+                if (f.mtime > lastCheckMs)
                     changedPaths.add(f.path);
-                }
             }
-            this.log(`   Dosya sistemi: ${changedPaths.size} dosya değişmiş/yeni`);
-            // Kaynak 2: POSTACI LOGU — loglanan değişiklikler
             const changeEntries = await this.changeLogger.readSince(lastCheck);
-            for (const e of changeEntries) {
+            for (const e of changeEntries)
                 changedPaths.add(e.filePath);
-            }
-            this.log(`   Postacı logu: ${changeEntries.length} değişiklik kaydı`);
-            // Kaynak 3: KENDİ LOGU — önceki denetimde hatalı olanlar (tekrar kontrol)
             const prevErrors = await this.getRecentErrors(lastCheck);
-            let prevErrorCount = 0;
             for (const pe of prevErrors) {
-                if (pe.status === "error") {
+                if (pe.status === "error")
                     changedPaths.add(pe.filePath);
-                    prevErrorCount++;
-                }
             }
-            this.log(`   Önceki hatalı: ${prevErrorCount} dosya → toplam ${changedPaths.size} dosya kontrol edilecek`);
+            this.log(`${changedPaths.size} değişen dosya taranıyor…`);
             for (const p of changedPaths) {
                 const content = await this.scanner.readFile(p);
                 if (content !== null)

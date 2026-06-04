@@ -6,7 +6,8 @@ function httpsPostJson(
   url: string,
   body: object,
   headers: Record<string, string>,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<{ status: number; data: any }> {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
@@ -22,10 +23,15 @@ function httpsPostJson(
       },
     };
 
+    if (signal?.aborted) { reject(new Error("İptal edildi")); return; }
+
     const req = https.request(options, (res) => {
-      let raw = "";
-      res.on("data", (chunk) => { raw += chunk; });
+      // Chunk'ları Buffer olarak topla — UTF-8 çok-byte karakterler (ş,ü,ğ) chunk
+      // sınırında bölünürse bozulmasın diye en sonda BİR KEZ decode ediyoruz.
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => { chunks.push(chunk); });
       res.on("end", () => {
+        const raw = Buffer.concat(chunks).toString("utf8");
         const status = res.statusCode || 0;
         let data: any = null;
         try { data = raw ? JSON.parse(raw) : null; } catch { data = raw; }
@@ -55,9 +61,16 @@ function httpsPostJson(
       }
     });
     req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error("İstek zaman aşımına uğradı")); });
+    // İptal: kullanıcı işi keserse isteği kapat
+    if (signal) signal.addEventListener("abort", () => { try { req.destroy(); } catch {} reject(new Error("İptal edildi")); }, { once: true });
     req.write(payload);
     req.end();
   });
+}
+
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
 }
 
 export interface AgentConfig {
@@ -100,9 +113,45 @@ export class AIRouter {
 
   // Her başarılı AI çağrısında token kullanımını bildiren global kanca
   private usageSink?: (model: string, usage: { promptTokens: number; completionTokens: number; totalTokens: number }) => void;
+  private isPro = true; // Pro değilse yalnızca ilk 3 agent aktif
+  private static FREE_AGENT_LIMIT = 3;
+  private languageHint = "en"; // Seçili dil (AI yanıt dili için)
 
   constructor(config: ChainConfig) {
     this.config = config;
+  }
+
+  // AI yanıt dilini ayarla
+  setLanguageHint(lang: string): void {
+    this.languageHint = lang;
+  }
+
+  private getLangInstruction(): string {
+    switch (this.languageHint) {
+      case "tr": return "\n\n[Lütfen Türkçe yanıt ver.]";
+      case "de": return "\n\n[Bitte antworte auf Deutsch.]";
+      case "fr": return "\n\n[Réponds en français.]";
+      case "es": return "\n\n[Responde en español.]";
+      case "ja": return "\n\n[日本語で回答してください。]";
+      case "zh": return "\n\n[请用中文回答。]";
+      default:  return "\n\n[Respond in English.]";
+    }
+  }
+
+  // Pro durumunu ayarla — free ise ilk 3 dışındaki agent'lar devre dışı sayılır
+  setProStatus(pro: boolean): void {
+    this.isPro = pro;
+  }
+
+  // Şu an kullanılabilir agent anahtarları (free ise ilk 3)
+  allowedAgentKeys(): string[] {
+    const keys = Object.keys(this.config.agents);
+    return this.isPro ? keys : keys.slice(0, AIRouter.FREE_AGENT_LIMIT);
+  }
+
+  // Bir agent free planda devre dışı mı?
+  isAgentDisabled(key: string): boolean {
+    return !this.allowedAgentKeys().includes(key);
   }
 
   // Token takibi için kanca bağla (extension → SpendingManager)
@@ -116,10 +165,10 @@ export class AIRouter {
   }
 
   // Postacı için: belirli bir modeli doğrudan çağır (agent config gerekmez)
-  async callDirect(model: string, systemPrompt: string, userPrompt: string, online = false): Promise<{ success: boolean; content: string; error?: string; usage?: any }> {
+  async callDirect(model: string, systemPrompt: string, userPrompt: string, online = false, signal?: AbortSignal): Promise<{ success: boolean; content: string; error?: string; usage?: any }> {
     try {
       const agent: AgentConfig = { name: "direct", model, role: "custom", systemPrompt };
-      const res = await this.callModel(agent, userPrompt, online);
+      const res = await this.callModel(agent, userPrompt, online, undefined, 4096, signal);
       return { success: true, content: res.content, usage: res.usage };
     } catch (err: any) {
       return { success: false, content: "", error: err?.message || "Bilinmeyen hata" };
@@ -143,13 +192,18 @@ export class AIRouter {
   }
 
   // Belirli bir agent'tan başlayarak fallback zinciriyle çalıştır (Postacı doğrudan çağırır)
-  async runFromAgent(startAgentKey: string, prompt: string, onlineSearch = false): Promise<RouterResult> {
-    // Prompt güvenlik kontrolü
-    if (!prompt || prompt.trim() === "") {
+  // history verilirse sohbet hafızası olarak kullanılır
+  async runFromAgent(startAgentKey: string, prompt: string, onlineSearch = false, history?: ChatMessage[]): Promise<RouterResult> {
+    // Prompt güvenlik kontrolü (history modunda prompt boş olabilir)
+    if ((!prompt || prompt.trim() === "") && (!history || history.length === 0)) {
       return this.errorResult([], "Prompt boş olamaz");
     }
     if (prompt.length > 200000) {
       return this.errorResult([], "Prompt çok uzun (max 200000 karakter)");
+    }
+    // Free planda ilk 3 dışındaki agent devre dışı
+    if (this.isAgentDisabled(startAgentKey)) {
+      return this.errorResult([], `Bu agent ücretsiz planda devre dışı (yalnızca ilk 3 agent kullanılabilir). Pro'ya geçin veya başka agent seçin.`);
     }
 
     const attempts: string[] = [];
@@ -186,32 +240,43 @@ export class AIRouter {
 
       attempts.push(currentAgentKey);
       const maxRetries = Math.min(Math.max(agent.maxRetries || 1, 1), 5);
+      let curMaxTokens = 4096; // kredi yetersizse düşürülür
 
       for (let attempt = 0; attempt < maxRetries; attempt++) {
         try {
-          const result = await this.callModel(agent, prompt, onlineSearch);
+          const result = await this.callModel(agent, prompt, onlineSearch, history, curMaxTokens);
           return { success: true, content: result.content, usedAgent: currentAgentKey, usedModel: agent.model, attempts, usage: result.usage };
         } catch (err: any) {
           const status = err?.response?.status;
           const msg = (err?.message || "").toLowerCase();
           const dataMsg = (JSON.stringify(err?.response?.data || "")).toLowerCase();
           const combined = msg + " " + dataMsg;
+
+          // AKILLI: "can only afford X tokens" → max_tokens'ı X'e düşür, AYNI modeli tekrar dene
+          const afford = combined.match(/afford (\d+)/);
+          if (afford && parseInt(afford[1]) > 200 && curMaxTokens > parseInt(afford[1])) {
+            curMaxTokens = parseInt(afford[1]) - 50;
+            attempt--; // bu denemeyi boşa sayma
+            continue;
+          }
           lastError = `${agent.model}: ${err?.message || "hata"}`;
 
           const isAuth = status === 401 || status === 403;
-          // Quota/rate limit'i HEM status koduyla HEM mesaj içeriğiyle yakala
-          // (minimax gibi modeller 429 yerine metin mesajı dönebiliyor)
+          // Quota/rate limit
           const isQuota = status === 402 || status === 429 ||
             /quota|insufficient|rate.?limit|rate limit|exceeded|too many|capacity|overloaded|token.{0,20}(limit|exceed|doldu)|limit.{0,20}(reach|exceed|doldu)|credits?/.test(combined);
+          // Provider/server hatası (5xx, "provider returned error") — retry boşa zaman, hemen geç
+          const isProviderError = (status && status >= 500) ||
+            /provider returned error|no endpoints|not a valid model|model.*(unavailable|not found)|bad gateway|service unavailable/.test(combined);
 
-          // Auth veya quota/limit → DENEMEDEN fallback'e geç
-          if (isAuth || isQuota) {
-            const reason = isAuth ? "yetki hatası" : "token/limit doldu";
+          // Auth / quota / provider hatası → DENEMEDEN (retry'sız) hemen fallback'e geç
+          if (isAuth || isQuota || isProviderError) {
             if (agent.fallback) {
               currentAgentKey = agent.fallback;
               break;
             }
-            return this.errorResult(attempts, `"${agent.name || currentAgentKey}" ${reason} ve yedek (fallback) tanımlı değil. Agentler bölümünden bu agent'a fallback ekleyin.`);
+            const reason = isAuth ? "yetki hatası" : isQuota ? "token/limit doldu" : "model şu an yanıt vermiyor";
+            return this.errorResult(attempts, `"${agent.name || currentAgentKey}" ${reason} ve yedek tanımlı değil.`);
           }
 
           // Son deneme ve fallback var → fallback'e geç
@@ -223,8 +288,8 @@ export class AIRouter {
             return this.errorResult(attempts, lastError);
           }
 
-          // Tekrar dene (kısa bekleme)
-          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+          // Geçici hata — kısa bekleyip tekrar dene (eski 1-3sn yerine 0.4-1.2sn)
+          await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
         }
       }
     }
@@ -236,12 +301,28 @@ export class AIRouter {
     return this.errorResult(attempts, lastError || "Tüm fallback zinciri tükendi");
   }
 
-  private async callModel(agent: AgentConfig, prompt: string, onlineSearch = false): Promise<{ content: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }> {
+  private async callModel(agent: AgentConfig, prompt: string, onlineSearch = false, history?: ChatMessage[], maxTokens = 4096, signal?: AbortSignal): Promise<{ content: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }> {
     const messages: any[] = [];
     if (agent.systemPrompt && agent.systemPrompt.trim()) {
       messages.push({ role: "system", content: agent.systemPrompt.trim() });
     }
-    messages.push({ role: "user", content: prompt });
+    // Sohbet geçmişi varsa onu kullan (hafıza), yoksa tek prompt
+    // Yalnızca user/assistant rolleri — UI notları (info vb.) API'leri bozar
+    const cleanHistory = (history || []).filter(m => m.role === "user" || m.role === "assistant");
+    // Dil talimatını son kullanıcı mesajına ekle (tüm AI çağrılarında seçili dile uyulur)
+    const langInstr = this.getLangInstruction();
+    if (cleanHistory.length > 0) {
+      for (const m of cleanHistory) messages.push({ role: m.role, content: m.content });
+      // Son user mesajına dil talimatını ekle
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === "user") {
+          messages[i].content += langInstr;
+          break;
+        }
+      }
+    } else {
+      messages.push({ role: "user", content: prompt + langInstr });
+    }
 
     const modelName = onlineSearch && !agent.model.includes(":online")
       ? agent.model + ":online"
@@ -249,19 +330,20 @@ export class AIRouter {
 
     // Agent'ın kendi API key'i varsa → direkt provider'a çağrı (OpenRouter değil)
     if (agent.apiKey) {
-      return this.callProviderDirect(agent, modelName, messages);
+      return this.callProviderDirect(agent, modelName, messages, maxTokens, signal);
     }
 
     // Yoksa normal OpenRouter çağrısı
     const response = await httpsPostJson(
       this.OPENROUTER_URL,
-      { model: modelName, messages, max_tokens: 8192 },
+      { model: modelName, messages, max_tokens: maxTokens },
       {
         Authorization: `Bearer ${this.config.openRouterKey}`,
         "HTTP-Referer": "https://github.com/sencerCetinturk/chainforge",
         "X-Title": "ChainForge VSCode Extension",
       },
-      120000
+      120000,
+      signal
     );
 
     const content = response.data?.choices?.[0]?.message?.content;
@@ -277,17 +359,20 @@ export class AIRouter {
   }
 
   // Agent'ın kendi API key'i ile direkt provider çağrısı (OpenAI uyumlu endpoint)
-  private async callProviderDirect(agent: AgentConfig, modelName: string, messages: any[]): Promise<{ content: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }> {
-    // Varsayılan endpoint OpenAI formatı
-    const endpoint = agent.apiEndpoint || "https://api.openai.com/v1/chat/completions";
+  private async callProviderDirect(agent: AgentConfig, modelName: string, messages: any[], maxTokens = 4096, signal?: AbortSignal): Promise<{ content: string; usage?: { promptTokens: number; completionTokens: number; totalTokens: number } }> {
+    // Endpoint verilmemişse modelin sağlayıcısından tahmin et
+    const endpoint = agent.apiEndpoint || this.guessEndpoint(modelName);
+    // Native API'ler "provider/model" değil sade model adı ister → prefix'i temizle
+    const nativeModel = endpoint.includes("openrouter.ai") ? modelName : modelName.replace(/^[^/]+\//, "").replace(/:.*$/, "");
 
     const response = await httpsPostJson(
       endpoint,
-      { model: modelName, messages, max_tokens: 8192 },
+      { model: nativeModel, messages, max_tokens: maxTokens },
       {
         Authorization: `Bearer ${agent.apiKey}`,
       },
-      120000
+      120000,
+      signal
     );
 
     const content = response.data?.choices?.[0]?.message?.content;
@@ -300,6 +385,17 @@ export class AIRouter {
     } : undefined;
     if (usage) this.usageSink?.(modelName, usage);
     return { content, usage };
+  }
+
+  // Kendi API key kullanılırken endpoint verilmemişse modelden tahmin et
+  private guessEndpoint(model: string): string {
+    const m = model.toLowerCase();
+    if (m.startsWith("deepseek")) return "https://api.deepseek.com/v1/chat/completions";
+    if (m.startsWith("groq") || m.includes("llama") && m.includes("groq")) return "https://api.groq.com/openai/v1/chat/completions";
+    if (m.startsWith("mistral")) return "https://api.mistral.ai/v1/chat/completions";
+    if (m.startsWith("google") || m.startsWith("gemini")) return "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+    // Varsayılan: OpenAI uyumlu
+    return "https://api.openai.com/v1/chat/completions";
   }
 
   private errorResult(attempts: string[], error: string): RouterResult {

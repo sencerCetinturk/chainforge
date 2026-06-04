@@ -14,15 +14,7 @@
       "name": "Fallback",
       "model": "google/gemini-flash-1-5",
       "role": "fallback",
-      "fallback": "supervisor",
       "maxRetries": 2
-    },
-    "supervisor": {
-      "name": "Supervisor",
-      "model": "anthropic/claude-sonnet-4-5",
-      "role": "supervisor",
-      "maxRetries": 1,
-      "systemPrompt": "You are a senior software architect. Review and improve code quality."
     }
   },
   "tasks": {

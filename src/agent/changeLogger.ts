@@ -46,6 +46,37 @@ export class ChangeLogger {
     return entry;
   }
 
+  // GEÇMİŞ FARKINDALIĞI: belirli dosyalar için en son değişiklikleri getir.
+  // Postacı, AI'ya "bu dosyada daha önce şunu değiştirdin" bağlamı verir.
+  async getRecentForFiles(filePaths: string[], maxPerFile = 2): Promise<ChangeLogEntry[]> {
+    if (!this.logDir || filePaths.length === 0) return [];
+    const wanted = new Set(filePaths);
+    const all: ChangeLogEntry[] = [];
+    try {
+      const files = await vscode.workspace.fs.readDirectory(this.logDir);
+      // En yeni dosyalar önce (ad = timestamp, ters sırala)
+      const names = files
+        .filter(([n, t]) => t === vscode.FileType.File && n.endsWith(".json"))
+        .map(([n]) => n)
+        .sort()
+        .reverse();
+      const perFileCount: Record<string, number> = {};
+      for (const name of names) {
+        if (all.length >= filePaths.length * maxPerFile) break;
+        const uri = vscode.Uri.joinPath(this.logDir, name);
+        try {
+          const e: ChangeLogEntry = JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8"));
+          if (!wanted.has(e.filePath)) continue;
+          perFileCount[e.filePath] = (perFileCount[e.filePath] || 0);
+          if (perFileCount[e.filePath] >= maxPerFile) continue;
+          perFileCount[e.filePath]++;
+          all.push(e);
+        } catch { /* atla */ }
+      }
+    } catch { /* klasör yok */ }
+    return all;
+  }
+
   // Son kontrolden BERİ değişen log dosyalarını oku.
   // Önce dosya ADLARINI (timestamp) süzer — sadece ilgili dosyaları açar, hepsini değil.
   async readSince(sinceTimestamp: string): Promise<ChangeLogEntry[]> {

@@ -8,7 +8,9 @@ const configManager_1 = require("./configManager");
 const panel_1 = require("./panel");
 const license_1 = require("./license");
 const spending_1 = require("./spending");
+const chatStore_1 = require("./chatStore");
 const telemetry_1 = require("./telemetry");
+const freeModels_1 = require("./freeModels");
 const orchestrator_1 = require("./agent/orchestrator");
 const workspaceScanner_1 = require("./agent/workspaceScanner");
 const changeLogger_1 = require("./agent/changeLogger");
@@ -19,11 +21,65 @@ let configManager = null;
 let licenseManager = null;
 let spendingManager = null;
 let telemetry = null;
+let chatStore = null;
 let chainPanel = null;
+let activeChatAbort = null; // sohbet iptali için
+// Model ID'yi kısa okunur ada çevir (UI canlı gösterge için)
+function shortModel(id) {
+    const fm = (0, freeModels_1.getFreeModel)(id);
+    if (fm)
+        return fm.label;
+    const parts = id.replace(":free", "").split("/");
+    return parts[parts.length - 1] || id;
+}
+// Teknik hata mesajlarını kullanıcı dostu tek satıra indirger (sorun: hata yağmuru)
+function simplifyError(raw) {
+    const m = (raw || "").toLowerCase();
+    if (/enotfound|getaddrinfo|network|econn/.test(m))
+        return "İnternete ulaşılamıyor. Bağlantınızı (veya VPN'i) kontrol edin.";
+    if (/401|403|unauthorized|api key|geçersiz.*key|invalid.*key/.test(m))
+        return "API anahtarı geçersiz. Ayarlar'dan kontrol edin veya ücretsiz modu kullanın.";
+    if (/quota|rate.?limit|exceeded|token.*(limit|doldu)|credits?/.test(m))
+        return "Bu modelin limiti doldu. Birazdan tekrar deneyin veya başka model seçin.";
+    if (/not a valid model|no endpoints|model.*not found/.test(m))
+        return "Seçili model şu an kullanılamıyor. Ayarlar'dan başka bir model seçin.";
+    if (/döngü|loop/.test(m))
+        return "Yedek ayarlarında döngü var. Ayarlar'dan agent yedeklerini kontrol edin.";
+    if (/timeout|zaman aşımı/.test(m))
+        return "İstek zaman aşımına uğradı. Tekrar deneyin.";
+    if (!raw)
+        return "Bir şeyler ters gitti. Tekrar deneyin.";
+    return raw.length > 120 ? raw.slice(0, 120) + "…" : raw;
+}
+// Seçilen dile göre AI sistem promptu oluşturur
+function getChatSystemPrompt(lang) {
+    switch (lang) {
+        case "tr": return "Sen yardımcı bir kod ve geliştirme asistanısın. Net, doğru ve özlü yanıt ver. Türkçe yanıt ver.";
+        case "de": return "Du bist ein hilfreicher Code- und Entwicklungsassistent. Sei klar, genau und präzise. Antworte auf Deutsch.";
+        case "fr": return "Tu es un assistant de code et de développement utile. Sois clair, précis et concis. Réponds en français.";
+        case "es": return "Eres un asistente de código y desarrollo útil. Sé claro, preciso y conciso. Responde en español.";
+        case "ja": return "あなたは役立つコーディング・開発アシスタントです。明確に、正確に、簡潔に答えてください。日本語で回答してください。";
+        case "zh": return "你是一个有用的编程和开发助手。请清晰、准确、简洁地回答。请用中文回答。";
+        default: return "You are a helpful coding and development assistant. Be clear, accurate, and concise. Respond in English.";
+    }
+}
+function getLanguageInstruction(lang) {
+    switch (lang) {
+        case "tr": return "Türkçe yanıt ver.";
+        case "de": return "Antworte auf Deutsch.";
+        case "fr": return "Réponds en français.";
+        case "es": return "Responde en español.";
+        case "ja": return "日本語で回答してください。";
+        case "zh": return "请用中文回答。";
+        default: return "Respond in English.";
+    }
+}
 async function activate(context) {
     configManager = new configManager_1.ConfigManager(context);
     licenseManager = new license_1.LicenseManager(context);
     spendingManager = new spending_1.SpendingManager(context);
+    (0, spending_1.refreshPricingCache)(context); // OpenRouter'dan güncel fiyatları arka planda çek (token harcamaz)
+    chatStore = new chatStore_1.ChatStore(context);
     const version = context.extension?.packageJSON?.version || "0.0.0";
     telemetry = new telemetry_1.TelemetryManager(context, version);
     context.subscriptions.push({ dispose: () => telemetry?.dispose() });
@@ -44,10 +100,13 @@ async function activate(context) {
         // Anonim kullanım telemetrisi (model adı + token sayısı, içerik değil)
         telemetry?.record({ type: "usage", name: "ai_call", model, tokens: usage.totalTokens, costUsd: cost });
     };
-    // Router oluşturulduğunda token kancasını bağla
+    // Router oluşturulduğunda token kancasını + Pro durumunu + dil ayarını bağla
     const makeRouter = (cfg) => {
         const r = new router_1.AIRouter(cfg);
         r.setUsageSink(recordUsage);
+        licenseManager.isPro().then(pro => r.setProStatus(pro));
+        const savedLang = vscode.workspace.getConfiguration("chainforge").get("language") || "en";
+        r.setLanguageHint(savedLang);
         return r;
     };
     const getLang = () => {
@@ -63,10 +122,13 @@ async function activate(context) {
     };
     const onActivateLicense = async (key) => {
         const result = await licenseManager.activateLicense(key);
+        if (result.valid)
+            router?.setProStatus(true);
         return { success: result.valid, error: result.error };
     };
     const onDeactivateLicense = async () => {
         await licenseManager.deactivateLicense();
+        router?.setProStatus(false); // Pro kaldırıldı → ilk 3 dışı agent'lar devre dışı
     };
     const onTask = async (prompt, taskType) => {
         if (!router)
@@ -87,7 +149,9 @@ async function activate(context) {
             router.updateConfig(currentConfig);
         chainPanel = new panel_1.AIChainPanel(context.extensionUri, currentConfig, onTask, () => configManager.openConfigFile(), async (key) => {
             await vscode.workspace.getConfiguration("chainforge").update("openRouterKey", key, vscode.ConfigurationTarget.Global);
-        }, onSaveConfig, onActivateLicense, onDeactivateLicense, currentIsPro, getLang(), licenseManager.getSavedKey(), spendingManager, !!vscode.workspace.getConfiguration("chainforge").get("openRouterKey"), telemetry?.getConsent() || "ask");
+        }, onSaveConfig, onActivateLicense, onDeactivateLicense, currentIsPro, getLang(), licenseManager.getSavedKey(), spendingManager, !!vscode.workspace.getConfiguration("chainforge").get("openRouterKey"), telemetry?.getConsent() || "ask", () => chatStore.get(), // proje bazlı geçmiş sohbet (canlı)
+        chatStore.summary() // ayarlar için özet
+        );
         return chainPanel;
     };
     // Komutları HEMEN kaydet
@@ -128,6 +192,125 @@ async function activate(context) {
     });
     const configure = vscode.commands.registerCommand("chainforge.configure", async () => {
         await configManager.openConfigFile();
+    });
+    // SOHBET — hafızalı konuşma (dosya yazmaz, önceki mesajları hatırlar)
+    // modelId: "__auto_free__" | "<provider/model:free>" | "agent:<key>"
+    const chat = vscode.commands.registerCommand("chainforge.chat", async (history, sendToPanel, modelId = "__auto_free__", lang = "en") => {
+        if (!router) {
+            sendToPanel({ command: "chatReply", data: { success: false, error: "Önce başlangıç ayarlarını yapın." } });
+            return;
+        }
+        const config = await configManager.loadConfig();
+        if (config)
+            router.updateConfig(config);
+        sendToPanel({ command: "chatLoading" });
+        // Yeni iptal denetleyici
+        activeChatAbort = new AbortController();
+        const signal = activeChatAbort.signal;
+        // AI'ya yalnızca user/assistant rolleri gider — "info" gibi UI notları API'yi bozar
+        const trimmed = history.filter(m => m.role === "user" || m.role === "assistant").slice(-20);
+        // PROJE FARKINDALIĞI — dosyaları DOĞRUDAN okur (açık olmaları gerekmez)
+        let systemPrompt = getChatSystemPrompt(lang || "en");
+        if (vscode.workspace.workspaceFolders) {
+            try {
+                const scanner = new workspaceScanner_1.WorkspaceScanner();
+                const files = await scanner.scanAll();
+                const fileList = files.slice(0, 60).map(f => f.path).join(", ");
+                const ctxLabel = (lang === "tr") ? "PROJE BAĞLAMI" : "PROJECT CONTEXT";
+                const ctxFiles = (lang === "tr") ? "Projedeki dosyalar" : "Project files";
+                systemPrompt += `\n\n[${ctxLabel}]\n${ctxFiles}: ${fileList || (lang === "tr" ? "(henüz dosya yok)" : "(no files yet)")}.`;
+                // Kullanıcının son sorusuna en alakalı dosyaları OKU (açık olması gerekmez)
+                const lastUserMsg = [...trimmed].reverse().find(m => m.role === "user")?.content || "";
+                const relevant = scanner.rankByRelevance(files, lastUserMsg, 4);
+                for (const rf of relevant) {
+                    const content = await scanner.readFile(rf.path);
+                    if (content) {
+                        systemPrompt += `\n\n--- DOSYA: ${rf.path} ---\n${content.slice(0, 2500)}`;
+                    }
+                }
+                // Editörde açık dosya varsa onu da ekle (öncelikli bağlam)
+                const editor = vscode.window.activeTextEditor;
+                if (editor && editor.document.uri.scheme === "file") {
+                    const fname = editor.document.fileName.split(/[\\/]/).pop();
+                    const openLabel = (lang === "tr") ? "ŞU AN AÇIK" : "CURRENTLY OPEN";
+                    systemPrompt += `\n\n[${openLabel}] "${fname}":\n${editor.document.getText().slice(0, 3000)}`;
+                }
+                const ctxInstr = (lang === "tr")
+                    ? "Yukarıdaki dosya içeriklerini kullanarak yanıt ver. Proje hakkındaki sorulara bu bağlamla cevap verebilirsin."
+                    : "Use the above file contents to answer. You can answer project-related questions with this context.";
+                systemPrompt += `\n\n${ctxInstr}`;
+            }
+            catch { /* workspace okunamadıysa bağlamsız devam */ }
+        }
+        // Agent başarısız olup ücretsiz modele geçildiğinde kullanıcıyı bilgilendiren not
+        let fallbackNotice = "";
+        try {
+            // 1) Kendi agent'ı seçildiyse → o agent'la dene; başarısızsa ücretsiz modele DÜŞ
+            if (modelId.startsWith("agent:")) {
+                const agentKey = modelId.slice(6);
+                if (config?.agents[agentKey]) {
+                    const agentName = config.agents[agentKey].name || agentKey;
+                    const result = await router.runFromAgent(agentKey, "", false, trimmed);
+                    if (result.success && result.content.trim()) {
+                        finishChat(true, result.content, result.usedModel, result.usage, undefined, sendToPanel);
+                        return;
+                    }
+                    // Agent çalışmadı → kullanıcıya neden geçildiğini bildir
+                    fallbackNotice = `"${agentName}" çalışmadı (${simplifyError(result.error || "")}). Ücretsiz modele geçildi.`;
+                }
+            }
+            // 2) Ücretsiz model(ler) — seçili model başarısızsa diğer ücretsizlere düş
+            const isSingleChoice = modelId !== "__auto_free__" && !modelId.startsWith("agent:");
+            const chosenLabel = isSingleChoice ? shortModel(modelId) : "";
+            const tryModels = (modelId === "__auto_free__" || modelId.startsWith("agent:"))
+                ? freeModels_1.FREE_FALLBACK_CHAIN
+                : [modelId, ...freeModels_1.FREE_FALLBACK_CHAIN.filter(m => m !== modelId)]; // seçili önce, sonra yedekler
+            const userLabel = (lang === "tr") ? "Kullanıcı" : "User";
+            const asstLabel = (lang === "tr") ? "Asistan" : "Assistant";
+            const convo = trimmed.map(m => `${m.role === "user" ? userLabel : asstLabel}: ${m.content}`).join("\n");
+            let lastErr = "";
+            for (let i = 0; i < tryModels.length; i++) {
+                if (signal.aborted) {
+                    sendToPanel({ command: "chatCancelled" });
+                    return;
+                }
+                const model = tryModels[i];
+                // CANLI: o an gerçekten denenen modeli panele bildir
+                sendToPanel({ command: "chatTrying", model: shortModel(model) });
+                const r = await router.callDirect(model, systemPrompt, convo, false, signal);
+                if (signal.aborted) {
+                    sendToPanel({ command: "chatCancelled" });
+                    return;
+                }
+                if (r.success && r.content.trim()) {
+                    const tokens = r.usage?.totalTokens || 0;
+                    // Seçili model dışında bir modele düşüldüyse bilgilendir
+                    let notice = fallbackNotice;
+                    if (!notice && isSingleChoice && i > 0) {
+                        notice = `${chosenLabel} şu an yanıt vermedi, ${shortModel(model)} ile cevaplandı.`;
+                    }
+                    sendToPanel({ command: "chatReply", data: { success: true, content: r.content, model: shortModel(model), tokens, notice } });
+                    telemetry?.record({ type: "feature", name: "chat", success: true, model });
+                    return;
+                }
+                lastErr = r.error || "boş yanıt";
+            }
+            sendToPanel({ command: "chatReply", data: { success: false, error: simplifyError(lastErr) } });
+            telemetry?.recordError("chat", lastErr);
+        }
+        catch (err) {
+            sendToPanel({ command: "chatReply", data: { success: false, error: simplifyError(err?.message || "") } });
+        }
+        function finishChat(ok, content, model, usage, error, send) {
+            if (ok) {
+                send({ command: "chatReply", data: { success: true, content, model: shortModel(model), tokens: usage?.totalTokens || 0 } });
+                telemetry?.record({ type: "feature", name: "chat", success: true, model });
+            }
+            else {
+                send({ command: "chatReply", data: { success: false, error: simplifyError(error || "") } });
+                telemetry?.recordError("chat", error || "", model);
+            }
+        }
     });
     // DENETMEN — dosyaları kontrol et (ilk kez tümü, sonra sadece değişenler)
     const inspect = vscode.commands.registerCommand("chainforge.inspect", async () => {
@@ -261,7 +444,7 @@ async function activate(context) {
                 sendToPanel({ command: "result", data: { success: true, content: "✅ Tüm dosyalar zaten temiz, düzeltilecek bir şey yok." } });
                 return;
             }
-            sendToPanel({ command: "result", data: { success: true, content: `🛠 Postacı devrede — ${errorFiles.length} hatalı dosya için düzeltme başlatılıyor...\n` } });
+            sendToPanel({ command: "result", data: { success: true, content: `${errorFiles.length} hatalı dosya düzeltiliyor…` } });
             // 2. Her hatalı dosya için düzeltme promptu hazırla
             const allChanges = [];
             // AI yanıtından dosya içeriğini parse eden yardımcı
@@ -381,7 +564,7 @@ TALİMATLAR:
     // AGENT MODU — Postacı: dosyaları tarar, araştırır, kod yazar
     // applyFiles=true → diff onayıyla dosyaya yazar + loglar
     // applyFiles=false → sadece adımları + üretilen içeriği gösterir
-    const agentTask = vscode.commands.registerCommand("chainforge.agentTask", async (presetPrompt, applyFiles = false, sendToPanel) => {
+    const agentTask = vscode.commands.registerCommand("chainforge.agentTask", async (presetPrompt, applyFiles = false, sendToPanel, lang = "en") => {
         if (!router) {
             const e = "Önce config + API key ayarlayın.";
             vscode.window.showErrorMessage(`ChainForge: ${e}`);
@@ -394,12 +577,14 @@ TALİMATLAR:
             sendToPanel?.({ command: "result", data: { success: false, error: e } });
             return;
         }
-        const userPrompt = presetPrompt || await vscode.window.showInputBox({
+        const rawPrompt = presetPrompt || await vscode.window.showInputBox({
             prompt: "Ne yapmak istiyorsun?",
             placeHolder: "Görevini doğal dilde yaz...",
         });
-        if (!userPrompt)
+        if (!rawPrompt)
             return;
+        // Seçilen dile göre yanıt dili talimatını ekle
+        const userPrompt = rawPrompt + "\n\n[" + getLanguageInstruction(lang) + "]";
         const config = await configManager.loadConfig();
         if (config)
             router.updateConfig(config);
@@ -410,8 +595,8 @@ TALİMATLAR:
         const steps = [];
         const log = (m) => { output.appendLine(m); steps.push(m); };
         const scanner = new workspaceScanner_1.WorkspaceScanner();
-        const orchestrator = new orchestrator_1.Orchestrator(router, scanner, log);
         const changeLogger = new changeLogger_1.ChangeLogger();
+        const orchestrator = new orchestrator_1.Orchestrator(router, scanner, log, undefined, changeLogger);
         const applier = new fileApplier_1.FileApplier();
         const codingTaskType = config ? Object.keys(config.tasks)[0] || "" : "";
         const t0 = Date.now();
@@ -471,6 +656,22 @@ TALİMATLAR:
     const setTelemetry = vscode.commands.registerCommand("chainforge.setTelemetry", (enabled) => {
         telemetry?.setConsent(enabled ? "granted" : "denied");
     });
+    // Sohbet geçmişini kaydet (proje bazlı)
+    const saveChat = vscode.commands.registerCommand("chainforge.saveChat", async (messages) => {
+        if (Array.isArray(messages))
+            await chatStore?.save(messages);
+    });
+    // Sohbeti yarıda kes
+    const cancelChat = vscode.commands.registerCommand("chainforge.cancelChat", () => {
+        activeChatAbort?.abort();
+    });
+    // Sohbet temizle: scope "current" (bu proje) | "all" (tümü)
+    const clearChat = vscode.commands.registerCommand("chainforge.clearChat", async (scope) => {
+        if (scope === "all")
+            await chatStore?.clearAll();
+        else
+            await chatStore?.clearCurrent();
+    });
     const openUrl = vscode.commands.registerCommand("chainforge.openUrl", async (url) => {
         const allowed = ["openrouter.ai", "dodopayments.com", "checkout.dodopayments.com", "dodo.pe"];
         try {
@@ -489,7 +690,7 @@ TALİMATLAR:
             panel.resolveWebviewView(webviewView, ctx, token);
         }
     };
-    context.subscriptions.push(openPanel, runTask, configure, openUrl, agentTask, inspect, inspectFromPanel, fixErrors, inspectReset, setTelemetry, vscode.window.registerWebviewViewProvider(panel_1.AIChainPanel.viewType, webviewProvider, {
+    context.subscriptions.push(openPanel, runTask, configure, openUrl, agentTask, chat, cancelChat, inspect, inspectFromPanel, fixErrors, inspectReset, setTelemetry, saveChat, clearChat, vscode.window.registerWebviewViewProvider(panel_1.AIChainPanel.viewType, webviewProvider, {
         webviewOptions: { retainContextWhenHidden: true }
     }));
     // Async başlatma
@@ -500,6 +701,11 @@ TALİMATLAR:
     licenseManager.checkSavedLicense();
     vscode.workspace.onDidChangeConfiguration(async (e) => {
         if (e.affectsConfiguration("chainforge")) {
+            // Dil değişikliğini router'a ilet
+            if (e.affectsConfiguration("chainforge.language")) {
+                const newLang = vscode.workspace.getConfiguration("chainforge").get("language") || "en";
+                router?.setLanguageHint(newLang);
+            }
             const newConfig = await configManager.loadConfig();
             if (newConfig) {
                 if (!router)

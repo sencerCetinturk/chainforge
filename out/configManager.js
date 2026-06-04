@@ -38,7 +38,7 @@ GÖREVİN: Kullanıcının isteğini en iyi şekilde yerine getirmek. Kod yaz, s
         },
         supervisor: {
             name: "Denetmen",
-            model: "google/gemini-2.5-flash:free",
+            model: "deepseek/deepseek-chat-v3-0324:free",
             role: "supervisor",
             maxRetries: 2,
             // ZİNCİR SONU — fallback YOK. (Önceden "fallback"e dönüyordu = sonsuz halka!)
