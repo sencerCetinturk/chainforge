@@ -41,7 +41,22 @@ function httpsPostJson(url, body, headers, timeoutMs) {
                 }
             });
         });
-        req.on("error", reject);
+        req.on("error", (e) => {
+            // DNS/bağlantı hatalarını anlaşılır mesaja çevir
+            if (e?.code === "ENOTFOUND" || e?.code === "EAI_AGAIN") {
+                const err = new Error("openrouter.ai adresine ulaşılamıyor. İnternet/VPN bağlantınızı kontrol edin (Türkiye'den erişim için VPN gerekebilir).");
+                err.code = e.code;
+                reject(err);
+            }
+            else if (e?.code === "ECONNRESET" || e?.code === "ETIMEDOUT") {
+                const err = new Error("Bağlantı kesildi. Tekrar deneyin.");
+                err.code = e.code;
+                reject(err);
+            }
+            else {
+                reject(e);
+            }
+        });
         req.setTimeout(timeoutMs, () => { req.destroy(); reject(new Error("İstek zaman aşımına uğradı")); });
         req.write(payload);
         req.end();
@@ -53,30 +68,69 @@ class AIRouter {
         this.MAX_CHAIN_DEPTH = 10; // Sonsuz döngü koruması
         this.config = config;
     }
+    // Token takibi için kanca bağla (extension → SpendingManager)
+    setUsageSink(fn) {
+        this.usageSink = fn;
+    }
+    // Config'e dışarıdan erişim (Postacı için)
+    getConfig() {
+        return this.config;
+    }
+    // Postacı için: belirli bir modeli doğrudan çağır (agent config gerekmez)
+    async callDirect(model, systemPrompt, userPrompt, online = false) {
+        try {
+            const agent = { name: "direct", model, role: "custom", systemPrompt };
+            const res = await this.callModel(agent, userPrompt, online);
+            return { success: true, content: res.content, usage: res.usage };
+        }
+        catch (err) {
+            return { success: false, content: "", error: err?.message || "Bilinmeyen hata" };
+        }
+    }
+    // Belirli bir agent rolüne sahip ilk agent'ı bul (Postacı için)
+    findAgentByRole(role) {
+        for (const [key, agent] of Object.entries(this.config.agents)) {
+            if (agent.role === role)
+                return key;
+        }
+        return null;
+    }
     async run(prompt, taskType) {
-        // Prompt güvenlik kontrolü
-        if (!prompt || prompt.trim() === "") {
-            return this.errorResult([], "Prompt boş olamaz");
-        }
-        if (prompt.length > 50000) {
-            return this.errorResult([], "Prompt çok uzun (max 50000 karakter)");
-        }
         const task = this.config.tasks[taskType];
         if (!task) {
             return this.errorResult([], `Bilinmeyen görev tipi: ${taskType}`);
         }
+        return this.runFromAgent(task.primary, prompt);
+    }
+    // Belirli bir agent'tan başlayarak fallback zinciriyle çalıştır (Postacı doğrudan çağırır)
+    async runFromAgent(startAgentKey, prompt, onlineSearch = false) {
+        // Prompt güvenlik kontrolü
+        if (!prompt || prompt.trim() === "") {
+            return this.errorResult([], "Prompt boş olamaz");
+        }
+        if (prompt.length > 200000) {
+            return this.errorResult([], "Prompt çok uzun (max 200000 karakter)");
+        }
         const attempts = [];
-        let currentAgentKey = task.primary;
+        const visited = new Set(); // Fallback döngüsü koruması
+        let currentAgentKey = startAgentKey;
         let depth = 0;
+        let lastError = "";
         while (currentAgentKey && depth < this.MAX_CHAIN_DEPTH) {
             depth++;
+            // DÖNGÜ KORUMASI: bu agent zaten denendiyse zincir kendine dönüyor demektir
+            if (visited.has(currentAgentKey)) {
+                return this.errorResult(attempts, `Fallback döngüsü: "${currentAgentKey}" tekrar geldi. Son hata: ${lastError || "bilinmiyor"}`);
+            }
+            visited.add(currentAgentKey);
             // Key doğrula
             const keyCheck = (0, validator_1.validateAgentKey)(currentAgentKey);
             if (!keyCheck.valid)
                 break;
             const agent = this.config.agents[currentAgentKey];
-            if (!agent)
-                break;
+            if (!agent) {
+                return this.errorResult(attempts, `Agent bulunamadı: "${currentAgentKey}". Fallback yanlış olabilir.`);
+            }
             // Model doğrula
             const modelCheck = (0, validator_1.validateModel)(agent.model);
             if (!modelCheck.valid) {
@@ -91,37 +145,36 @@ class AIRouter {
             const maxRetries = Math.min(Math.max(agent.maxRetries || 1, 1), 5);
             for (let attempt = 0; attempt < maxRetries; attempt++) {
                 try {
-                    const content = await this.callModel(agent, prompt);
-                    return { success: true, content, usedAgent: currentAgentKey, usedModel: agent.model, attempts };
+                    const result = await this.callModel(agent, prompt, onlineSearch);
+                    return { success: true, content: result.content, usedAgent: currentAgentKey, usedModel: agent.model, attempts, usage: result.usage };
                 }
                 catch (err) {
                     const status = err?.response?.status;
-                    const isRateLimit = status === 429;
-                    const isQuota = status === 402 || err?.message?.includes("quota") || err?.message?.includes("insufficient");
+                    const msg = (err?.message || "").toLowerCase();
+                    const dataMsg = (JSON.stringify(err?.response?.data || "")).toLowerCase();
+                    const combined = msg + " " + dataMsg;
+                    lastError = `${agent.model}: ${err?.message || "hata"}`;
                     const isAuth = status === 401 || status === 403;
-                    // Auth hatası — fallback'e geç, denemeden vazgeç
-                    if (isAuth) {
+                    // Quota/rate limit'i HEM status koduyla HEM mesaj içeriğiyle yakala
+                    // (minimax gibi modeller 429 yerine metin mesajı dönebiliyor)
+                    const isQuota = status === 402 || status === 429 ||
+                        /quota|insufficient|rate.?limit|rate limit|exceeded|too many|capacity|overloaded|token.{0,20}(limit|exceed|doldu)|limit.{0,20}(reach|exceed|doldu)|credits?/.test(combined);
+                    // Auth veya quota/limit → DENEMEDEN fallback'e geç
+                    if (isAuth || isQuota) {
+                        const reason = isAuth ? "yetki hatası" : "token/limit doldu";
                         if (agent.fallback) {
                             currentAgentKey = agent.fallback;
                             break;
                         }
-                        return this.errorResult(attempts, "API key geçersiz veya yetkisiz");
+                        return this.errorResult(attempts, `"${agent.name || currentAgentKey}" ${reason} ve yedek (fallback) tanımlı değil. Agentler bölümünden bu agent'a fallback ekleyin.`);
                     }
-                    // Quota/rate limit — fallback'e geç
-                    if (isRateLimit || isQuota) {
-                        if (agent.fallback) {
-                            currentAgentKey = agent.fallback;
-                            break;
-                        }
-                        return this.errorResult(attempts, "Token limiti doldu ve fallback yok");
-                    }
-                    // Son deneme ve fallback var
+                    // Son deneme ve fallback var → fallback'e geç
                     if (attempt === maxRetries - 1) {
                         if (agent.fallback) {
                             currentAgentKey = agent.fallback;
                             break;
                         }
-                        return this.errorResult(attempts, err?.message || "Bilinmeyen hata");
+                        return this.errorResult(attempts, lastError);
                     }
                     // Tekrar dene (kısa bekleme)
                     await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
@@ -129,17 +182,25 @@ class AIRouter {
             }
         }
         if (depth >= this.MAX_CHAIN_DEPTH) {
-            return this.errorResult(attempts, "Maksimum fallback derinliğine ulaşıldı");
+            return this.errorResult(attempts, `Çok uzun fallback zinciri. Denenen: ${attempts.join(" → ")}. Son hata: ${lastError}`);
         }
-        return this.errorResult(attempts, "Tüm fallback zinciri tükendi");
+        return this.errorResult(attempts, lastError || "Tüm fallback zinciri tükendi");
     }
-    async callModel(agent, prompt) {
+    async callModel(agent, prompt, onlineSearch = false) {
         const messages = [];
         if (agent.systemPrompt && agent.systemPrompt.trim()) {
             messages.push({ role: "system", content: agent.systemPrompt.trim() });
         }
         messages.push({ role: "user", content: prompt });
-        const response = await httpsPostJson(this.OPENROUTER_URL, { model: agent.model, messages, max_tokens: 4096 }, {
+        const modelName = onlineSearch && !agent.model.includes(":online")
+            ? agent.model + ":online"
+            : agent.model;
+        // Agent'ın kendi API key'i varsa → direkt provider'a çağrı (OpenRouter değil)
+        if (agent.apiKey) {
+            return this.callProviderDirect(agent, modelName, messages);
+        }
+        // Yoksa normal OpenRouter çağrısı
+        const response = await httpsPostJson(this.OPENROUTER_URL, { model: modelName, messages, max_tokens: 8192 }, {
             Authorization: `Bearer ${this.config.openRouterKey}`,
             "HTTP-Referer": "https://github.com/sencerCetinturk/chainforge",
             "X-Title": "ChainForge VSCode Extension",
@@ -147,7 +208,35 @@ class AIRouter {
         const content = response.data?.choices?.[0]?.message?.content;
         if (!content)
             throw new Error("Model boş yanıt döndürdü");
-        return content;
+        const u = response.data?.usage;
+        const usage = u ? {
+            promptTokens: u.prompt_tokens || 0,
+            completionTokens: u.completion_tokens || 0,
+            totalTokens: u.total_tokens || 0,
+        } : undefined;
+        if (usage)
+            this.usageSink?.(agent.model, usage);
+        return { content, usage };
+    }
+    // Agent'ın kendi API key'i ile direkt provider çağrısı (OpenAI uyumlu endpoint)
+    async callProviderDirect(agent, modelName, messages) {
+        // Varsayılan endpoint OpenAI formatı
+        const endpoint = agent.apiEndpoint || "https://api.openai.com/v1/chat/completions";
+        const response = await httpsPostJson(endpoint, { model: modelName, messages, max_tokens: 8192 }, {
+            Authorization: `Bearer ${agent.apiKey}`,
+        }, 120000);
+        const content = response.data?.choices?.[0]?.message?.content;
+        if (!content)
+            throw new Error("Model boş yanıt döndürdü");
+        const u = response.data?.usage;
+        const usage = u ? {
+            promptTokens: u.prompt_tokens || 0,
+            completionTokens: u.completion_tokens || 0,
+            totalTokens: u.total_tokens || 0,
+        } : undefined;
+        if (usage)
+            this.usageSink?.(modelName, usage);
+        return { content, usage };
     }
     errorResult(attempts, error) {
         return { success: false, content: "", usedAgent: "", usedModel: "", attempts, error };

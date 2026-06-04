@@ -1,58 +1,16 @@
 import * as vscode from "vscode";
 import { ChainConfig } from "./router";
 import { translations, languageNames, Language } from "./i18n";
+import { SpendingManager } from "./spending";
 
-export class AIChainPanel {
-  public static currentPanel: AIChainPanel | undefined;
-  private readonly panel: vscode.WebviewPanel;
+export class AIChainPanel implements vscode.WebviewViewProvider {
+  public static readonly viewType = "chainforgeView";
+  private view?: vscode.WebviewView;
   private disposables: vscode.Disposable[] = [];
-  private nonce: string;
+  private nonce: string = "";
 
-  public static createOrShow(
-    extensionUri: vscode.Uri,
-    config: ChainConfig | null,
-    onTask: (prompt: string, taskType: string) => Promise<any>,
-    onOpenConfig: () => void,
-    onSaveKey: (key: string) => void,
-    onSaveConfig: (config: ChainConfig) => void,
-    onActivateLicense: (key: string) => Promise<{ success: boolean; error?: string }>,
-    onDeactivateLicense: () => Promise<void>,
-    isPro: boolean,
-    lang: string = "en",
-    licenseKey: string = ""
-  ) {
-    const column = vscode.window.activeTextEditor ? vscode.ViewColumn.Beside : undefined;
-
-    if (AIChainPanel.currentPanel) {
-      AIChainPanel.currentPanel.panel.reveal(column);
-      return;
-    }
-
-    const panel = vscode.window.createWebviewPanel(
-      "aiChain", "⛓ AI Chain",
-      column || vscode.ViewColumn.One,
-      {
-        enableScripts: true,
-        localResourceRoots: [extensionUri],
-        retainContextWhenHidden: true,
-      }
-    );
-
-    AIChainPanel.currentPanel = new AIChainPanel(
-      panel, config, onTask, onOpenConfig, onSaveKey,
-      onSaveConfig, onActivateLicense, onDeactivateLicense, isPro, lang, licenseKey
-    );
-  }
-
-  private generateNonce(): string {
-    let text = "";
-    const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    for (let i = 0; i < 32; i++) text += possible.charAt(Math.floor(Math.random() * possible.length));
-    return text;
-  }
-
-  private constructor(
-    panel: vscode.WebviewPanel,
+  constructor(
+    private readonly extensionUri: vscode.Uri,
     private config: ChainConfig | null,
     private onTask: (prompt: string, taskType: string) => Promise<any>,
     private onOpenConfig: () => void,
@@ -62,31 +20,75 @@ export class AIChainPanel {
     private onDeactivateLicense: () => Promise<void>,
     private isPro: boolean,
     private lang: string = "en",
-    private licenseKey: string = ""
+    private licenseKey: string = "",
+    private spendingManager?: SpendingManager,
+    private hasApiKey: boolean = false,
+    private telemetryConsent: string = "ask"
   ) {
-    this.panel = panel;
     this.nonce = this.generateNonce();
-    this.update();
-    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+  }
 
-    this.panel.webview.onDidReceiveMessage(async (message) => {
+  public resolveWebviewView(
+    webviewView: vscode.WebviewView,
+    _context: vscode.WebviewViewResolveContext,
+    _token: vscode.CancellationToken
+  ) {
+    this.view = webviewView;
+    webviewView.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [this.extensionUri],
+    };
+    this.update();
+
+    webviewView.onDidDispose(() => {
+      this.view = undefined;
+      while (this.disposables.length) {
+        const d = this.disposables.pop();
+        if (d) d.dispose();
+      }
+    }, null, this.disposables);
+
+    webviewView.webview.onDidReceiveMessage(async (message) => {
+      await this.handleMessage(message);
+    }, null, this.disposables);
+  }
+
+  public focus() {
+    this.view?.show(true);
+  }
+
+  private generateNonce(): string {
+    let text = "";
+    const possible = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    for (let i = 0; i < 32; i++) text += possible.charAt(Math.floor(Math.random() * possible.length));
+    return text;
+  }
+
+  private async handleMessage(message: any) {
       if (!message || typeof message.command !== "string") return;
 
       switch (message.command) {
         case "runTask": {
           if (typeof message.prompt !== "string" || typeof message.taskType !== "string") return;
           if (message.prompt.length > 50000) {
-            this.panel.webview.postMessage({ command: "result", data: { success: false, error: "Prompt çok uzun" } });
+            this.view?.webview.postMessage({ command: "result", data: { success: false, error: "Prompt çok uzun" } });
             return;
           }
-          this.panel.webview.postMessage({ command: "loading" });
+          this.view?.webview.postMessage({ command: "loading" });
           const result = await this.onTask(message.prompt, message.taskType);
-          this.panel.webview.postMessage({ command: "result", data: result });
+          this.view?.webview.postMessage({ command: "result", data: result });
           break;
         }
         case "openConfig":
           this.onOpenConfig();
           break;
+        case "agentTask": {
+          if (typeof message.prompt !== "string") return;
+          vscode.commands.executeCommand("chainforge.agentTask", message.prompt, !!message.applyFiles, (payload: any) => {
+            this.view?.webview.postMessage(payload);
+          });
+          break;
+        }
         case "changeLang": {
           if (typeof message.lang !== "string") return;
           const validLangs = ["en", "tr", "de", "fr", "es", "ja", "zh"];
@@ -111,28 +113,26 @@ export class AIChainPanel {
         case "saveKey": {
           if (typeof message.key !== "string") return;
           if (!message.key.startsWith("sk-or-") && !message.key.startsWith("sk-")) {
-            this.panel.webview.postMessage({ command: "keyError", error: "Geçersiz OpenRouter key formatı" });
+            this.view?.webview.postMessage({ command: "keyError", error: "Geçersiz OpenRouter key formatı" });
             return;
           }
           this.onSaveKey(message.key);
-          this.panel.webview.postMessage({ command: "keySaved" });
+          this.view?.webview.postMessage({ command: "keySaved" });
           break;
         }
         case "saveAgent": {
           if (!message.agent || typeof message.agent !== "object") return;
-          const result = (this.panel.webview as any)._context?.configManager?.validateAndAddAgent
-            ? null
-            : this.validateAndApplyAgent(message.agent, message.isEdit);
+          const result = this.validateAndApplyAgent(message.agent, message.isEdit);
           if (result && !result.success) {
-            this.panel.webview.postMessage({ command: "agentError", error: result.error });
+            this.view?.webview.postMessage({ command: "agentError", error: result.error });
             return;
           }
           if (this.config) {
             const r = this.applyAgent(message.agent, message.isEdit);
-            if (!r.success) { this.panel.webview.postMessage({ command: "agentError", error: r.error }); return; }
+            if (!r.success) { this.view?.webview.postMessage({ command: "agentError", error: r.error }); return; }
             this.onSaveConfig(this.config);
             this.update();
-            this.panel.webview.postMessage({ command: "agentSaved" });
+            this.view?.webview.postMessage({ command: "agentSaved" });
           }
           break;
         }
@@ -143,7 +143,7 @@ export class AIChainPanel {
               .filter(([k, a]) => a.fallback === message.key && k !== message.key)
               .map(([k]) => k);
             if (dependents.length > 0) {
-              this.panel.webview.postMessage({ command: "agentError", error: `Önce şu agent'ların fallback'ini değiştirin: ${dependents.join(", ")}` });
+              this.view?.webview.postMessage({ command: "agentError", error: `Önce şu agent'ların fallback'ini değiştirin: ${dependents.join(", ")}` });
               return;
             }
             delete this.config.agents[message.key];
@@ -155,10 +155,10 @@ export class AIChainPanel {
         case "saveTask": {
           if (!message.task || typeof message.task !== "object") return;
           const r = this.applyTask(message.task, message.isEdit);
-          if (!r.success) { this.panel.webview.postMessage({ command: "taskError", error: r.error }); return; }
+          if (!r.success) { this.view?.webview.postMessage({ command: "taskError", error: r.error }); return; }
           this.onSaveConfig(this.config!);
           this.update();
-          this.panel.webview.postMessage({ command: "taskSaved" });
+          this.view?.webview.postMessage({ command: "taskSaved" });
           break;
         }
         case "deleteTask": {
@@ -173,7 +173,7 @@ export class AIChainPanel {
         case "saveFile": {
           if (typeof message.content !== "string" || typeof message.filename !== "string") return;
           if (!/^[a-zA-Z0-9_\-\.]{1,100}$/.test(message.filename)) {
-            this.panel.webview.postMessage({ command: "fileError", error: "Geçersiz dosya adı" });
+            this.view?.webview.postMessage({ command: "fileError", error: "Geçersiz dosya adı" });
             return;
           }
           await this.saveFile(message.content, message.filename);
@@ -182,17 +182,17 @@ export class AIChainPanel {
         case "activateLicense": {
           if (typeof message.key !== "string") return;
           if (!/^[A-Za-z0-9\-_]{10,100}$/.test(message.key.trim())) {
-            this.panel.webview.postMessage({ command: "licenseError", error: "Geçersiz lisans key formatı" });
+            this.view?.webview.postMessage({ command: "licenseError", error: "Geçersiz lisans key formatı" });
             return;
           }
-          this.panel.webview.postMessage({ command: "licenseLoading" });
+          this.view?.webview.postMessage({ command: "licenseLoading" });
           const result = await this.onActivateLicense(message.key.trim());
           if (result.success) {
             this.isPro = true;
             this.update();
-            this.panel.webview.postMessage({ command: "licenseActivated" });
+            this.view?.webview.postMessage({ command: "licenseActivated" });
           } else {
-            this.panel.webview.postMessage({ command: "licenseError", error: result.error || "Aktivasyon başarısız" });
+            this.view?.webview.postMessage({ command: "licenseError", error: result.error || "Aktivasyon başarısız" });
           }
           break;
         }
@@ -207,22 +207,81 @@ export class AIChainPanel {
             this.isPro = false;
             this.licenseKey = "";
             this.update();
-            this.panel.webview.postMessage({ command: "licenseDeactivated" });
+            this.view?.webview.postMessage({ command: "licenseDeactivated" });
           }
           break;
         }
+        case "getFileContext": {
+          const editor = vscode.window.activeTextEditor;
+          if (editor) {
+            const content = editor.document.getText();
+            const filename = editor.document.fileName.split(/[\\/]/).pop() || "file";
+            this.view?.webview.postMessage({ command: "fileContext", content, filename });
+          }
+          break;
+        }
+        case "applyToFile": {
+          if (typeof message.content !== "string") return;
+          const editor = vscode.window.activeTextEditor;
+          if (editor) {
+            editor.edit(editBuilder => {
+              if (editor.selection.isEmpty) {
+                editBuilder.insert(editor.selection.active, message.content);
+              } else {
+                editBuilder.replace(editor.selection, message.content);
+              }
+            });
+          }
+          break;
+        }
+        case "clearStats": {
+          this.spendingManager?.clearAll();
+          this.update();
+          break;
+        }
+        case "setTelemetry": {
+          this.telemetryConsent = message.enabled ? "granted" : "denied";
+          vscode.commands.executeCommand("chainforge.setTelemetry", !!message.enabled);
+          break;
+        }
+        case "runInspection": {
+          vscode.commands.executeCommand("chainforge.inspectFromPanel", (payload: any) => {
+            this.view?.webview.postMessage(payload);
+          });
+          break;
+        }
+        case "fixErrors": {
+          vscode.commands.executeCommand("chainforge.fixErrors", (payload: any) => {
+            this.view?.webview.postMessage(payload);
+          });
+          break;
+        }
       }
-    }, null, this.disposables);
   }
 
   private validateAndApplyAgent(data: any, isEdit: boolean): { success: boolean; error?: string } {
     if (!data.key || !/^[a-zA-Z0-9_\-]{1,50}$/.test(data.key)) return { success: false, error: "Key geçersiz" };
     if (!data.name || data.name.length > 100) return { success: false, error: "İsim geçersiz" };
-    if (!data.model || !/^[a-zA-Z0-9_\-]+\/[a-zA-Z0-9_\-\.]+$/.test(data.model)) return { success: false, error: "Model formatı geçersiz (örn: minimax/minimax-m3)" };
+    if (!data.model || (!/^[a-zA-Z0-9_\-]+\/[a-zA-Z0-9_\-\.]+$/.test(data.model) && data.model !== "openrouter/auto")) return { success: false, error: "Model formatı geçersiz (örn: minimax/minimax-m3)" };
     if (!["coding","math","routing","long-coding","fallback","supervisor","custom"].includes(data.role)) return { success: false, error: "Geçersiz rol" };
     if (data.systemPrompt && data.systemPrompt.length > 2000) return { success: false, error: "Sistem promptu max 2000 karakter" };
     if (data.systemPrompt && /<script|javascript:|eval\(/i.test(data.systemPrompt)) return { success: false, error: "Sistem promptunda geçersiz içerik" };
     if (data.fallback && data.fallback === data.key) return { success: false, error: "Agent kendine fallback olamaz" };
+    // Fallback HALKASI kontrolü: A→B→A gibi döngü oluşmasını engelle
+    if (data.fallback && this.config?.agents) {
+      const visited = new Set<string>([data.key]);
+      let cur: string | undefined = data.fallback;
+      while (cur) {
+        if (visited.has(cur)) {
+          return { success: false, error: `Fallback halkası! "${cur}" zincirde tekrar ediyor. Fallback bir zincir olmalı, halka değil (örn: A→B→C, A→B→A DEĞİL).` };
+        }
+        visited.add(cur);
+        cur = this.config.agents[cur]?.fallback;
+      }
+    }
+    if (data.apiKey && data.apiKey.length > 200) return { success: false, error: "API key max 200 karakter" };
+    if (data.apiEndpoint && data.apiEndpoint.length > 300) return { success: false, error: "API endpoint max 300 karakter" };
+    if (data.apiEndpoint && !/^https?:\/\/.+/.test(data.apiEndpoint)) return { success: false, error: "API endpoint geçersiz URL" };
     return { success: true };
   }
 
@@ -245,6 +304,8 @@ export class AIChainPanel {
       fallback: data.fallback || undefined,
       maxRetries: Math.min(Math.max(parseInt(data.maxRetries) || 2, 1), 5),
       systemPrompt: data.systemPrompt?.trim() || undefined,
+      apiKey: data.apiKey?.trim() || undefined,
+      apiEndpoint: data.apiEndpoint?.trim() || undefined,
     };
     return { success: true };
   }
@@ -287,7 +348,7 @@ export class AIChainPanel {
 
   private update() {
     this.nonce = this.generateNonce();
-    this.panel.webview.html = this.getHtml();
+    if (this.view) this.view.webview.html = this.getHtml();
   }
 
   private escapeHtml(str: string): string {
@@ -384,6 +445,10 @@ export class AIChainPanel {
     const langOptions = Object.entries(languageNames).map(([code, name]) =>
       `<option value="${code}" ${code === lang ? "selected" : ""}>${name}</option>`
     ).join("");
+
+    // Harcama istatistikleri
+    const stats = this.spendingManager?.getMonthlyStats() || { byModel: {}, totalCost: 0, totalTokens: 0, totalRequests: 0, month: "" };
+    const statsJson = JSON.stringify(stats);
 
     // Script içinde kullanılacak çevirileri JSON olarak inject et
     const i18nJson = JSON.stringify({
@@ -485,6 +550,7 @@ a{color:var(--vscode-textLink-foreground)}
   <button class="tab active" id="tab-run">${t('tabRun')}</button>
   <button class="tab" id="tab-agents">${t('tabAgents')}</button>
   <button class="tab" id="tab-tasks">${t('tabTasks')}</button>
+  <button class="tab" id="tab-stats">📊 ${t('tabStats') || 'Kullanım'}</button>
   <button class="tab" id="tab-settings">${t('tabSettings')}</button>
 </div>
 
@@ -496,9 +562,15 @@ a{color:var(--vscode-textLink-foreground)}
   <label for="prompt">${t('prompt')}</label>
   <textarea id="prompt" placeholder="${t('promptPlaceholder') || ''}"></textarea>
 
+  <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin:8px 0;cursor:pointer;color:var(--vscode-editor-foreground)">
+    <input type="checkbox" id="applyFiles" style="width:auto;margin:0" />
+    📝 Dosyalara uygula <span style="font-size:10px;color:var(--vscode-descriptionForeground)">(işaretsizse sadece gösterir)</span>
+  </label>
   <div class="btn-row">
     <button id="btnRun">${t('btnRun')}</button>
+    <button id="btnInspect" class="btn-sec">${t('btnInspect') || '🔍 Dosyaları Tara'}</button>
     <button id="btnClear" class="btn-sec">${t('btnClear')}</button>
+    <button id="btnFileCtx" class="btn-sec" title="Aktif dosyayı prompta ekle">📎 ${t('btnFileCtx') || 'Dosya Ekle'}</button>
   </div>
 
   <div class="divider"></div>
@@ -509,9 +581,26 @@ a{color:var(--vscode-textLink-foreground)}
     <span>${t('agentLabel')} <b id="metaAgent"></b></span>
     <span>${t('modelLabel')} <span id="metaModel"></span></span>
     <span>${t('chainLabel')} <span id="metaAttempts"></span></span>
+    <span id="metaTokens" style="display:none">🔢 <span id="metaTokenCount"></span> token</span>
+    <span id="metaCost" style="display:none">💰 $<span id="metaCostVal"></span></span>
   </div>
   <div class="btn-row" id="saveRow" style="display:none">
     <button id="btnShowSave">${t('saveFile')}</button>
+    <button id="btnApplyFile" class="btn-sec" title="Editördeki dosyaya uygula">📝 Dosyaya Uygula</button>
+  </div>
+
+  <!-- Denetim sonuçları alanı -->
+  <div id="inspectSection" style="display:none;margin-top:14px">
+    <div class="divider"></div>
+    <div class="sec-label">🔍 Denetim Sonuçları <span id="inspectSummary" style="font-weight:400;font-size:11px"></span></div>
+    <label style="display:flex;align-items:center;gap:6px;font-size:11px;margin:6px 0;cursor:pointer;color:var(--vscode-descriptionForeground)">
+      <input type="checkbox" id="autoFix" checked style="width:auto;margin:0" />
+      Hata bulununca Postacı otomatik düzeltsin
+    </label>
+    <div class="result-box" id="inspectResult" style="max-height:400px"></div>
+    <div class="btn-row" id="inspectActions" style="display:none">
+      <button id="btnFixErrors" class="btn-sec" style="background:#f59e0b20;color:#f59e0b">🛠 Hataları Düzelt (Postacı)</button>
+    </div>
   </div>
 </div>
 
@@ -532,11 +621,20 @@ a{color:var(--vscode-textLink-foreground)}
   <div id="taskErr" class="err-msg"></div>
 </div>
 
+<!-- STATS TAB -->
+<div class="tab-content" id="content-stats">
+  <div class="sec-label">📊 ${new Date().toLocaleString('tr-TR', {month:'long', year:'numeric'})} Kullanımı</div>
+  <div id="statsContent"></div>
+  <div class="divider"></div>
+  <button id="btnClearStats" class="btn-danger btn-sec" style="font-size:11px">🗑 İstatistikleri Temizle</button>
+</div>
+
 <!-- SETTINGS TAB -->
 <div class="tab-content" id="content-settings">
   <div class="sec-label">${t('settingsKey')}</div>
+  ${this.hasApiKey ? `<div style="font-size:11px;color:#10b981;margin-bottom:6px">✓ API key kayıtlı. Değiştirmek için yeni key girin.</div>` : ""}
   <div class="key-row">
-    <input type="password" id="apiKey" placeholder="sk-or-..." autocomplete="off" />
+    <input type="password" id="apiKey" placeholder="${this.hasApiKey ? "•••••••• (kayıtlı)" : "sk-or-..."}" autocomplete="off" />
     <button id="btnSaveKey">${t('btnSaveKey')}</button>
   </div>
   <div id="keyErr" class="err-msg"></div>
@@ -559,6 +657,19 @@ a{color:var(--vscode-textLink-foreground)}
   ` : ""}
 
   <div class="divider"></div>
+  <div class="sec-label">📡 Anonim Veri Paylaşımı</div>
+  <div style="font-size:11px;color:var(--vscode-descriptionForeground);margin-bottom:8px">
+    Hata ve kullanım verileri (kod/prompt/key ASLA gönderilmez) toolu geliştirmemize yardım eder.
+  </div>
+  <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;margin-bottom:6px">
+    <input type="checkbox" id="telemetryToggle" ${this.telemetryConsent === "granted" ? "checked" : ""} style="width:auto;margin:0" />
+    Anonim veri paylaşımını etkinleştir
+  </label>
+  <div id="telemetryStatus" style="font-size:11px;color:${this.telemetryConsent === "granted" ? "#10b981" : "var(--vscode-descriptionForeground)"}">
+    Durum: ${this.telemetryConsent === "granted" ? "✓ Etkin" : this.telemetryConsent === "denied" ? "Kapalı" : "Onay bekliyor"}
+  </div>
+
+  <div class="divider"></div>
   <div class="sec-label">${t('advanced')}</div>
   <button id="btnOpenConfig" class="btn-sec">${t('editConfig')}</button>
 </div>
@@ -574,7 +685,8 @@ a{color:var(--vscode-textLink-foreground)}
     <label>${t('agentModel')} <span style="font-size:10px;color:var(--vscode-descriptionForeground)">(provider/model-name)</span></label>
     <input id="agentModel" placeholder="${t('agentModelPlaceholder')}" maxlength="100" autocomplete="off" />
     <p style="font-size:10px;color:var(--vscode-descriptionForeground);margin-top:3px">
-      ${t('models')} <a id="linkModels" href="#">openrouter.ai/models</a>
+      ${t('models')} <a id="linkModels" href="#">openrouter.ai/models</a> &nbsp;|&nbsp;
+      Otomatik: <code style="background:var(--vscode-textBlockQuote-background);padding:1px 4px;border-radius:2px">openrouter/auto</code>
     </p>
     <label>${t('agentRole')}</label>
     <select id="agentRole">
@@ -595,6 +707,15 @@ a{color:var(--vscode-textLink-foreground)}
     <input id="agentRetries" type="number" value="2" min="1" max="5" />
     <label>${t('agentPrompt')}</label>
     <textarea id="agentSystemPrompt" placeholder="${t('agentPromptPlaceholder')}" maxlength="2000"></textarea>
+    ${this.isPro ? `
+    <div style="background:#f59e0b10;border:1px solid #f59e0b30;border-radius:4px;padding:8px;margin-top:10px">
+      <label style="color:#f59e0b;margin-top:0">🔑 Kendi API Key (Pro)</label>
+      <input type="password" id="agentApiKey" placeholder="sk-... (boş bırakılırsa OpenRouter kullanılır)" maxlength="200" autocomplete="off" style="margin-top:4px" />
+      <label style="margin-top:6px">API Endpoint (opsiyonel)</label>
+      <input id="agentApiEndpoint" placeholder="https://api.openai.com/v1/chat/completions" maxlength="300" autocomplete="off" style="margin-top:4px" />
+      <p style="font-size:10px;color:var(--vscode-descriptionForeground);margin-top:4px">Kendi API key'inizi girerseniz, bu agent OpenRouter yerine doğrudan provider'a bağlanır.</p>
+    </div>
+    ` : ""}
     <div id="agentModalErr" class="err-msg" style="margin-top:8px"></div>
     <div class="btn-row">
       <button id="btnSaveAgent">${t('saveBtn')}</button>
@@ -671,9 +792,36 @@ a{color:var(--vscode-textLink-foreground)}
   var agents = JSON.parse(atob('${agentsJson}'));
   var tasks = JSON.parse(atob('${tasksJson}'));
   var i18n = ${i18nJson};
+  var stats = ${statsJson};
   var lastResult = "";
   var editingAgentKey = null;
   var editingTaskKey = null;
+
+  // Stats tabını doldur
+  function renderStats() {
+    var el = document.getElementById('statsContent');
+    if (!el) return;
+    var s = stats;
+    var models = Object.keys(s.byModel || {});
+    if (models.length === 0) {
+      el.innerHTML = '<p class="empty" style="margin-top:8px">Henüz kullanım yok.</p>';
+      return;
+    }
+    var rows = models.sort(function(a,b){ return (s.byModel[b].cost||0)-(s.byModel[a].cost||0); }).map(function(m) {
+      var d = s.byModel[m];
+      return '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--vscode-panel-border);font-size:11px">'
+        + '<div style="flex:1;min-width:0"><div style="font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + m + '</div>'
+        + '<div style="color:var(--vscode-descriptionForeground)">' + d.requests + ' istek · ' + (d.tokens||0).toLocaleString() + ' token</div></div>'
+        + '<div style="font-weight:600;color:#10b981;margin-left:8px">$' + (d.cost||0).toFixed(4) + '</div></div>';
+    }).join('');
+    el.innerHTML = '<div style="display:flex;justify-content:space-between;margin-bottom:10px">'
+      + '<div><div style="font-size:20px;font-weight:700;color:#10b981">$' + (s.totalCost||0).toFixed(4) + '</div>'
+      + '<div style="font-size:11px;color:var(--vscode-descriptionForeground)">Toplam maliyet</div></div>'
+      + '<div style="text-align:right"><div style="font-size:16px;font-weight:600">' + (s.totalTokens||0).toLocaleString() + '</div>'
+      + '<div style="font-size:11px;color:var(--vscode-descriptionForeground)">' + (s.totalRequests||0) + ' istek</div></div></div>'
+      + rows;
+  }
+  renderStats();
 
   // Dil değiştirme
   document.getElementById('langSelect').addEventListener('change', function(e) {
@@ -681,7 +829,7 @@ a{color:var(--vscode-textLink-foreground)}
   });
 
   // Tab switching
-  ['run','agents','tasks','settings'].forEach(function(name) {
+  ['run','agents','tasks','stats','settings'].forEach(function(name) {
     var btn = document.getElementById('tab-' + name);
     if (btn) btn.addEventListener('click', function() {
       document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
@@ -692,8 +840,45 @@ a{color:var(--vscode-textLink-foreground)}
   });
 
   // Run
+  // Dosya bağlamı
+  var btnFileCtx = document.getElementById('btnFileCtx');
+  if (btnFileCtx) btnFileCtx.addEventListener('click', function() {
+    vscode.postMessage({ command: 'getFileContext' });
+  });
+
+  // Dosyaya uygula
+  var btnApplyFile = document.getElementById('btnApplyFile');
+  if (btnApplyFile) btnApplyFile.addEventListener('click', function() {
+    if (lastResult) vscode.postMessage({ command: 'applyToFile', content: lastResult });
+  });
+
+  // Stats temizle
+  var btnClearStats = document.getElementById('btnClearStats');
+  if (btnClearStats) btnClearStats.addEventListener('click', function() {
+    vscode.postMessage({ command: 'clearStats' });
+  });
+
   var btnRun = document.getElementById('btnRun');
   if (btnRun) btnRun.addEventListener('click', runTask);
+
+  // Dosyaları Tara / Denetle butonu
+  var btnInspect = document.getElementById('btnInspect');
+  if (btnInspect) btnInspect.addEventListener('click', function() {
+    document.getElementById('inspectSection').style.display = 'block';
+    document.getElementById('inspectResult').innerHTML = '<span class="loading">⏳ Dosyalar taranıyor, AI analiz ediyor...</span>';
+    document.getElementById('inspectSummary').textContent = '';
+    document.getElementById('inspectActions').style.display = 'none';
+    btnInspect.disabled = true;
+    vscode.postMessage({ command: 'runInspection' });
+  });
+
+  // Hataları Düzelt butonu — Postacı'ya ilet
+  var btnFixErrors = document.getElementById('btnFixErrors');
+  if (btnFixErrors) btnFixErrors.addEventListener('click', function() {
+    btnFixErrors.disabled = true;
+    btnFixErrors.textContent = '⏳ Postacı hataları düzeltiyor...';
+    vscode.postMessage({ command: 'fixErrors' });
+  });
 
   var btnClear = document.getElementById('btnClear');
   if (btnClear) btnClear.addEventListener('click', function() {
@@ -710,12 +895,13 @@ a{color:var(--vscode-textLink-foreground)}
 
   function runTask() {
     var prompt = document.getElementById('prompt').value.trim();
-    var taskType = document.getElementById('taskType').value;
     if (!prompt) return;
+    var applyEl = document.getElementById('applyFiles');
+    var applyFiles = applyEl ? applyEl.checked : false;
     document.getElementById('result').innerHTML = '<span class="loading">⏳ ' + i18n.running + '</span>';
     document.getElementById('meta').style.display = 'none';
     document.getElementById('saveRow').style.display = 'none';
-    vscode.postMessage({ command: 'runTask', prompt: prompt, taskType: taskType });
+    vscode.postMessage({ command: 'agentTask', prompt: prompt, applyFiles: applyFiles });
   }
 
   // Settings
@@ -726,6 +912,16 @@ a{color:var(--vscode-textLink-foreground)}
     showOk('keyOk', '');
     if (!key) { showErr('keyErr', i18n.keyEmpty); return; }
     vscode.postMessage({ command: 'saveKey', key: key });
+  });
+
+  var telemetryToggle = document.getElementById('telemetryToggle');
+  if (telemetryToggle) telemetryToggle.addEventListener('change', function() {
+    vscode.postMessage({ command: 'setTelemetry', enabled: telemetryToggle.checked });
+    var st = document.getElementById('telemetryStatus');
+    if (st) {
+      st.textContent = 'Durum: ' + (telemetryToggle.checked ? '✓ Etkin' : 'Kapalı');
+      st.style.color = telemetryToggle.checked ? '#10b981' : 'var(--vscode-descriptionForeground)';
+    }
   });
 
   var btnOpenConfig = document.getElementById('btnOpenConfig');
@@ -845,6 +1041,11 @@ a{color:var(--vscode-textLink-foreground)}
       document.getElementById('agentFallback').value = a.fallback || '';
       document.getElementById('agentRetries').value = a.maxRetries || 2;
       document.getElementById('agentSystemPrompt').value = a.systemPrompt || '';
+      // Pro: API key
+      var akEl = document.getElementById('agentApiKey');
+      var epEl = document.getElementById('agentApiEndpoint');
+      if (akEl) akEl.value = a.apiKey || '';
+      if (epEl) epEl.value = a.apiEndpoint || '';
     } else {
       document.getElementById('agentKey').value = '';
       document.getElementById('agentName').value = '';
@@ -868,6 +1069,13 @@ a{color:var(--vscode-textLink-foreground)}
       maxRetries: document.getElementById('agentRetries').value,
       systemPrompt: document.getElementById('agentSystemPrompt').value,
     };
+    // Pro: agent API key ve endpoint
+    var apiKeyEl = document.getElementById('agentApiKey');
+    var apiEpEl = document.getElementById('agentApiEndpoint');
+    if (apiKeyEl && apiKeyEl.value.trim()) {
+      data.apiKey = apiKeyEl.value.trim();
+      if (apiEpEl && apiEpEl.value.trim()) data.apiEndpoint = apiEpEl.value.trim();
+    }
     if (!data.key || !data.name || !data.model) {
       showErr('agentModalErr', i18n.agentFieldsRequired);
       return;
@@ -961,10 +1169,26 @@ a{color:var(--vscode-textLink-foreground)}
           document.getElementById('metaAgent').textContent = msg.data.usedAgent || '';
           document.getElementById('metaModel').textContent = msg.data.usedModel || '';
           document.getElementById('metaAttempts').textContent = (msg.data.attempts || []).join(' → ');
+          if (msg.data.usage) {
+            var u = msg.data.usage;
+            document.getElementById('metaTokenCount').textContent = (u.totalTokens || 0).toLocaleString();
+            document.getElementById('metaTokens').style.display = 'inline';
+            if (msg.data.estimatedCost != null) {
+              document.getElementById('metaCostVal').textContent = msg.data.estimatedCost.toFixed(4);
+              document.getElementById('metaCost').style.display = 'inline';
+            }
+          }
           document.getElementById('meta').style.display = 'flex';
           document.getElementById('saveRow').style.display = 'flex';
         } else {
           document.getElementById('result').textContent = '❌ ' + ((msg.data && msg.data.error) || i18n.unknownError);
+        }
+        break;
+      case 'fileContext':
+        var promptEl2 = document.getElementById('prompt');
+        if (promptEl2 && msg.content) {
+          var sep = promptEl2.value ? '\\n\\n' : '';
+          promptEl2.value = sep + '--- ' + msg.filename + ' ---\\n' + msg.content;
         }
         break;
       case 'agentSaved':
@@ -1001,6 +1225,86 @@ a{color:var(--vscode-textLink-foreground)}
         break;
       case 'licenseDeactivated':
         break;
+      case 'inspectionProgress':
+        if (msg.data) {
+          var pct = msg.data.total > 0 ? Math.round(msg.data.checked / msg.data.total * 100) : 0;
+          document.getElementById('inspectResult').innerHTML = '<span class="loading">⏳ Taranıyor: '
+            + msg.data.checked + '/' + msg.data.total + ' (%' + pct + ') — ' + (msg.data.currentFile || '') + '</span>';
+        }
+        break;
+      case 'inspectionDone':
+        if (msg.data) {
+          var d = msg.data;
+          var btn = document.getElementById('btnInspect');
+          if (btn) btn.disabled = false;
+          document.getElementById('inspectSummary').textContent =
+            '— ' + d.checked + ' dosya, ' + d.errors + ' hatalı, ' + d.clean + ' temiz';
+          // Hatalı dosya varsa düzelt butonunu göster
+          var fixBtn = document.getElementById('btnFixErrors');
+          var actRow = document.getElementById('inspectActions');
+          if (actRow && fixBtn && d.errors > 0) {
+            actRow.style.display = 'flex';
+            fixBtn.disabled = false;
+            fixBtn.textContent = '🛠 Hataları Düzelt (Postacı)';
+            // Otomatik düzeltme açıksa Postacı'yı kendiliğinden tetikle
+            var autoFixEl = document.getElementById('autoFix');
+            if (autoFixEl && autoFixEl.checked) {
+              fixBtn.disabled = true;
+              fixBtn.textContent = '⏳ Postacı otomatik düzeltiyor...';
+              setTimeout(function() { vscode.postMessage({ command: 'fixErrors' }); }, 1200);
+            }
+          } else if (actRow) {
+            actRow.style.display = 'none';
+          }
+
+          // Rapor metni varsa onu direkt göster (zaten formatlı)
+          if (d.report) {
+            document.getElementById('inspectResult').innerHTML =
+              '<pre style="font-family:var(--vscode-editor-font-family);font-size:11px;line-height:1.4;white-space:pre-wrap;margin:0">'
+              + d.report + '</pre>';
+          } else {
+            var html = '';
+            if (d.files && d.files.length > 0) {
+              // Hatalı dosyalar
+              var errFiles = d.files.filter(function(f) { return f.status === 'error'; });
+              var cleanFiles = d.files.filter(function(f) { return f.status === 'clean'; });
+
+              if (errFiles.length > 0) {
+                html += '<div style="font-weight:600;color:#ef4444;margin-bottom:8px">❌ HATALI DOSYALAR (' + errFiles.length + ')</div>';
+                for (var i = 0; i < errFiles.length; i++) {
+                  var f = errFiles[i];
+                  html += '<div style="margin-bottom:10px;padding:8px;background:var(--vscode-sideBar-background);border-left:3px solid #ef4444;border-radius:4px">';
+                  html += '<div style="font-weight:600;margin-bottom:4px">📄 ' + f.path + ' — ' + f.issues.length + ' sorun</div>';
+                  for (var j = 0; j < f.issues.length; j++) {
+                    var iss = f.issues[j];
+                    var sevColor = iss.severity === 'error' ? '#ef4444' : '#f59e0b';
+                    html += '<div style="margin:6px 0;padding:6px;background:var(--vscode-editor-background);border-radius:3px">';
+                    html += '<span style="color:' + sevColor + ';font-weight:600">Satır ' + iss.line + ' [' + iss.severity + ']</span>';
+                    html += '<div style="margin-top:3px">' + iss.message + '</div>';
+                    if (iss.code) html += '<pre style="font-size:10px;color:var(--vscode-descriptionForeground);margin:4px 0 0;padding:4px;background:var(--vscode-textBlockQuote-background);border-radius:2px;overflow-x:auto">' + iss.code + '</pre>';
+                    html += '</div>';
+                  }
+                  html += '</div>';
+                }
+              }
+              if (cleanFiles.length > 0) {
+                html += '<div style="font-weight:600;color:#10b981;margin:12px 0 6px">✅ TEMİZ DOSYALAR (' + cleanFiles.length + ')</div>';
+                html += '<div style="font-size:11px;color:var(--vscode-descriptionForeground)">';
+                for (var k = 0; k < cleanFiles.length; k++) {
+                  html += '✅ ' + cleanFiles[k].path + '<br>';
+                }
+                html += '</div>';
+              }
+            }
+            document.getElementById('inspectResult').innerHTML = html || '<p style="color:var(--vscode-descriptionForeground)">Kontrol edilecek dosya bulunamadı.</p>';
+          }
+        }
+        break;
+      case 'inspectionError':
+        var btn2 = document.getElementById('btnInspect');
+        if (btn2) btn2.disabled = false;
+        document.getElementById('inspectResult').innerHTML = '<span style="color:#ef4444">❌ ' + (msg.error || 'Denetim hatası') + '</span>';
+        break;
     }
   });
 
@@ -1010,12 +1314,4 @@ a{color:var(--vscode-textLink-foreground)}
 </html>`;
   }
 
-  public dispose() {
-    AIChainPanel.currentPanel = undefined;
-    this.panel.dispose();
-    while (this.disposables.length) {
-      const d = this.disposables.pop();
-      if (d) d.dispose();
-    }
-  }
 }

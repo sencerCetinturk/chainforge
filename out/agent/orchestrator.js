@@ -1,0 +1,345 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Orchestrator = void 0;
+// POSTACI (Orchestrator)
+// Akış:
+// 1. Workspace'i tarar, ilgili dosyaları bulur
+// 2. Planlama: araştırma/matematik gerekli mi, hangi dosyalar?
+// 3. Gerekiyorsa araştırma (web :online) + matematik bilgisi toplar
+// 4. Tüm bilgi + dosya içerikleriyle kod yazan AI'ya promptu verir
+// 5. AI yanıtını FileChange[] olarak parse eder
+class Orchestrator {
+    constructor(router, scanner, log, postmanModel) {
+        this.router = router;
+        this.scanner = scanner;
+        this.log = log;
+        // Config'de routing rolünde agent varsa onun modelini öne al
+        const routingAgent = this.router.findAgentByRole("routing");
+        const cfg = this.router.getConfig();
+        const preferred = postmanModel || (routingAgent ? cfg.agents[routingAgent]?.model : undefined);
+        // Ücretsiz model fallback zinciri (provider hatalarına karşı dayanıklı)
+        this.postmanModels = [
+            ...(preferred ? [preferred] : []),
+            "qwen/qwen3-coder:free",
+            "openai/gpt-oss-120b:free",
+            "z-ai/glm-4.5-air:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+        ];
+    }
+    // Postacı çağrısı — ücretsiz modeller arasında otomatik fallback
+    async postmanCall(systemPrompt, userPrompt, online = false) {
+        let lastErr = "";
+        for (const model of this.postmanModels) {
+            const res = await this.router.callDirect(model, systemPrompt, userPrompt, online);
+            if (res.success && res.content.trim()) {
+                return { success: true, content: res.content, model };
+            }
+            lastErr = res.error || "boş yanıt";
+            this.log(`   ⚠ ${model} başarısız (${lastErr}), sıradaki deneniyor...`);
+        }
+        return { success: false, content: "", model: "", error: lastErr };
+    }
+    async run(userPrompt, codingTaskType) {
+        const knowledge = [];
+        // --- 1. Workspace tara ---
+        this.log("📂 Workspace taranıyor...");
+        const allFiles = await this.scanner.scanAll();
+        const relevant = this.scanner.rankByRelevance(allFiles, userPrompt, 15);
+        this.log(`   ${allFiles.length} dosya bulundu, ${relevant.length} alakalı.`);
+        // --- 2. Planlama (POSTACI = ücretsiz model) ---
+        this.log(`🧭 Postacı planlıyor...`);
+        const plan = await this.makePlan(userPrompt, relevant, allFiles);
+        this.log(`   Hedef dosyalar: ${plan.targetFiles.join(", ") || "(yeni)"}`);
+        if (plan.needsResearch)
+            this.log("   🔍 Araştırma gerekli.");
+        if (plan.needsMath)
+            this.log("   🔢 Matematik/uzman gerekli.");
+        // --- 3a. Araştırma (POSTACI ücretsiz model + web :online) ---
+        if (plan.needsResearch) {
+            this.log("🔍 Postacı web araştırması yapıyor...");
+            const q = plan.searchQuery || userPrompt;
+            const res = await this.postmanCall("Sen bir araştırmacısın. Güncel, doğru ve özet bilgi topla.", `Şu konuda güncel bilgi topla:\n${q}`, true);
+            if (res.success) {
+                knowledge.push({ source: "research", agentKey: "postman", model: res.model, content: res.content });
+                this.log(`   ✓ ${res.content.length} karakter bilgi toplandı (${res.model}).`);
+            }
+            else {
+                this.log(`   ⚠ Araştırma başarısız: ${res.error}`);
+            }
+        }
+        // --- 3b. Matematik/uzman (özel AI — sadece görev verilir, dosya görmez) ---
+        if (plan.needsMath) {
+            const mathAgent = this.router.findAgentByRole("math") || this.router.findAgentByRole("supervisor");
+            if (mathAgent) {
+                const mathModel = this.router.getConfig().agents[mathAgent]?.model || "?";
+                this.log(`🔢 Uzman AI'dan görüş alınıyor (${mathModel})...`);
+                const res = await this.router.runFromAgent(mathAgent, `Şu görev için gerekli matematik/fizik/mantık hesaplarını yap, sonuçları net ver:\n${userPrompt}`);
+                if (res.success) {
+                    knowledge.push({ source: "math", agentKey: res.usedAgent, model: res.usedModel, content: res.content });
+                    this.log(`   ✓ Uzman bilgisi alındı.`);
+                }
+            }
+            else {
+                this.log("   ⚠ Matematik rolünde AI tanımlı değil, atlanıyor.");
+            }
+        }
+        // --- 4. İlgili dosya içeriklerini oku ---
+        const fileContents = [];
+        for (const fp of plan.targetFiles) {
+            const content = await this.scanner.readFile(fp);
+            if (content !== null)
+                fileContents.push({ path: fp, content });
+        }
+        // --- 5. Postacı, uzman kod AI'sına görevi iletir (AI dosya görmez, sadece kod üretir) ---
+        const task = this.router.getConfig().tasks[codingTaskType];
+        const codingStart = task?.primary || this.router.findAgentByRole("coding");
+        if (!codingStart) {
+            return { success: false, error: "Kod yazacak agent bulunamadı", knowledge, changes: [], codingAgent: "", codingModel: "", attempts: [] };
+        }
+        const codingModel = this.router.getConfig().agents[codingStart]?.model || "?";
+        this.log(`✏️  Postacı, kod görevini uzman AI'ya iletiyor (${codingModel})...`);
+        // Agent'ın rolünü al ve promptu rolüne göre özelleştir
+        const codingAgent = this.router.getConfig().agents[codingStart];
+        const agentRole = codingAgent?.role || "coding";
+        const codingPrompt = this.buildCodingPrompt(userPrompt, plan, knowledge, fileContents, agentRole);
+        const codeRes = await this.router.runFromAgent(codingStart, codingPrompt);
+        if (!codeRes.success) {
+            return { success: false, error: codeRes.error, knowledge, changes: [], codingAgent: codeRes.usedAgent, codingModel: codeRes.usedModel, attempts: codeRes.attempts };
+        }
+        // --- 6. POSTACI yanıtı parse eder (dosya yazımı postacının işi, AI'nın değil) ---
+        const changes = this.parseChanges(codeRes.content, fileContents);
+        if (changes.length === 0) {
+            this.log(`\n⚠ Uzman AI yanıtı parse edilemedi. Ham yanıt:\n${"─".repeat(50)}\n${codeRes.content}\n${"─".repeat(50)}`);
+        }
+        else {
+            this.log(`   ✓ Postacı ${changes.length} dosya değişikliği hazırladı (uzman: ${codeRes.usedModel}).`);
+        }
+        return {
+            success: true,
+            plan,
+            knowledge,
+            changes,
+            codingAgent: codeRes.usedAgent,
+            codingModel: codeRes.usedModel,
+            attempts: codeRes.attempts,
+            rawResponse: codeRes.content,
+        };
+    }
+    // Planlama: POSTACI (ücretsiz model) JSON formatında plan üretir
+    async makePlan(userPrompt, relevant, all) {
+        const fileList = relevant.map(f => `- ${f.path} (${f.language})`).join("\n");
+        const planPrompt = `Kullanıcı isteği: "${userPrompt}"
+
+Workspace'teki mevcut dosyalar:
+${fileList || "(boş workspace)"}
+
+Şu JSON formatında yanıtla (SADECE JSON, başka hiçbir şey yazma):
+{
+  "intent": "isteğin tek cümlelik özeti",
+  "needsResearch": false,
+  "needsMath": false,
+  "searchQuery": null,
+  "targetFiles": ["oluşturulacak veya düzenlenecek TÜM dosya yolları"]
+}
+
+Kurallar:
+- Kullanıcı yeni dosya istiyorsa targetFiles'a o yolu ekle (örn "utils/string.js").
+- Mevcut dosya değişecekse onu da ekle.
+- Sadece güncel/internet bilgisi gerekiyorsa needsResearch=true.
+- Sadece hesaplama/formül gerekiyorsa needsMath=true.`;
+        const res = await this.postmanCall("Sen bir görev planlayıcı postacısın. Sadece geçerli JSON döndürürsün.", planPrompt);
+        if (res.success) {
+            const parsed = this.extractJson(res.content);
+            if (parsed) {
+                let targets = Array.isArray(parsed.targetFiles) ? parsed.targetFiles : [];
+                // Plan dosya bulamadıysa prompttan çıkar
+                if (targets.length === 0)
+                    targets = this.extractFilesFromPrompt(userPrompt);
+                this.log(`   ✓ Plan hazır (${res.model}).`);
+                return {
+                    needsResearch: !!parsed.needsResearch,
+                    needsMath: !!parsed.needsMath,
+                    targetFiles: targets,
+                    intent: parsed.intent || userPrompt,
+                    searchQuery: parsed.searchQuery || undefined,
+                };
+            }
+            this.log(`   ⚠ Plan JSON parse edilemedi, basit moda geçiliyor.`);
+        }
+        else {
+            this.log(`   ⚠ Tüm ücretsiz modeller başarısız, basit moda geçiliyor.`);
+        }
+        // FALLBACK: prompttan dosya adlarını çıkar, yoksa alakalı dosyaları kullan
+        const fromPrompt = this.extractFilesFromPrompt(userPrompt);
+        const targets = fromPrompt.length > 0 ? fromPrompt : relevant.slice(0, 3).map(f => f.path);
+        return { needsResearch: false, needsMath: false, targetFiles: targets, intent: userPrompt };
+    }
+    // Prompt içinden dosya yollarını yakala (örn "calculator.js", "utils/string.js")
+    extractFilesFromPrompt(prompt) {
+        const matches = prompt.match(/[\w\-./]+\.[a-zA-Z][a-zA-Z0-9]{0,4}\b/g) || [];
+        // Geçerli uzantılı, yol gibi görünenleri al
+        const valid = matches.filter(m => /\.(js|ts|jsx|tsx|py|java|cpp|c|h|cs|go|rs|rb|php|html|css|scss|json|md|vue|svelte|sql|sh|yml|yaml)$/i.test(m));
+        return Array.from(new Set(valid));
+    }
+    // Kod yazan AI'ya verilecek tam promptu kur
+    buildCodingPrompt(userPrompt, plan, knowledge, files, agentRole = "coding") {
+        let p = "";
+        // Agent rolüne göre görev tanımını özelleştir
+        switch (agentRole) {
+            case "supervisor":
+                p = `Sen kıdemli bir yazılım mimarı ve kod denetçisisin. Aşağıdaki kodu DERİNLEMESİNE incele.
+
+GÖREV: ${userPrompt}
+NİYET: ${plan.intent}
+
+DENETİM TALİMATLARI:
+1. MİMARİ: SOLID, katmanlı yapı, bağımlılık yönetimi
+2. GÜVENLİK: Injection, XSS, hassas veri sızıntısı, yetkilendirme
+3. PERFORMANS: Gereksiz işlemler, algoritma karmaşıklığı, bellek kullanımı
+4. HATA YÖNETİMİ: Eksik validasyon, boş catch, sessiz hatalar
+5. KOD KALİTESİ: DRY ihlalleri, sihirli sayılar, aşırı karmaşıklık
+6. TİP GÜVENLİĞİ: any kullanımı, eksik tipler, tip daraltma sorunları
+
+Her bulgu için satır numarası, sorun açıklaması ve düzeltme önerisi ver.
+`;
+                break;
+            case "math":
+                p = `Sen bir matematik ve algoritma uzmanısın. Aşağıdaki problemi çöz.
+
+GÖREV: ${userPrompt}
+NİYET: ${plan.intent}
+
+TALİMATLAR:
+1. Hesaplamalarını ADIM ADIM göster
+2. Formülleri açıkça yaz
+3. Sonucu net bir şekilde belirt
+4. Gerekirse alternatif çözüm yollarını da göster
+`;
+                break;
+            case "routing":
+                p = `Sen bir görev yönlendirme uzmanısın. Aşağıdaki isteği analiz et ve en uygun yaklaşımı belirle.
+
+GÖREV: ${userPrompt}
+NİYET: ${plan.intent}
+
+TALİMATLAR:
+1. İsteğin karmaşıklığını değerlendir
+2. Hangi teknolojilerin/bilgilerin gerektiğini belirle
+3. En uygun çözüm stratejisini öner
+4. Gerekirse araştırma yapılması gereken konuları listele
+`;
+                break;
+            default: // coding, long-coding, fallback, custom
+                p = `Sen uzman bir yazılım geliştiricisin. Aşağıdaki görevi yerine getir.
+
+GÖREV: ${userPrompt}
+NİYET: ${plan.intent}
+`;
+                break;
+        }
+        if (knowledge.length > 0) {
+            p += `\n=== TOPLANAN BİLGİ ===\n`;
+            for (const k of knowledge) {
+                p += `[${k.source.toUpperCase()} - ${k.model}]\n${k.content}\n\n`;
+            }
+        }
+        if (files.length > 0) {
+            p += `\n=== MEVCUT DOSYALAR ===\n`;
+            for (const f of files) {
+                p += `\n--- DOSYA: ${f.path} ---\n${f.content}\n`;
+            }
+        }
+        p += `
+=== ÇIKTI FORMATI (ÇOK ÖNEMLİ) ===
+Her dosya için AYNEN şu formatı kullan, başka HİÇBİR ŞEY yazma:
+
+<<<FILE: dosya/yolu.uzanti | ACTION: create>>>
+(buraya dosyanın TAM ve EKSİKSİZ içeriğini yaz — markdown kod bloğu KULLANMA, doğrudan kod yaz)
+<<<END>>>
+
+KESİN KURALLAR:
+1. Her dosya <<<FILE: ...>>> ile başlar, <<<END>>> ile biter.
+2. İçeriği \`\`\` ile SARMA — doğrudan kodu yaz.
+3. Dosyanın TAMAMINI yaz, "..." veya "değişmeyen kısım" gibi kısaltma YAPMA.
+4. Mevcut dosyayı düzenliyorsan ACTION: modify, yeni dosyaysa ACTION: create.
+5. <<<FILE>>> blokları dışında açıklama, selamlama, özet YAZMA.
+6. Görevi TEK SEFERDE eksiksiz tamamla — kodu yarım bırakma.
+
+ÖRNEK:
+<<<FILE: hello.js | ACTION: create>>>
+function hello() {
+  console.log("Merhaba");
+}
+module.exports = { hello };
+<<<END>>>`;
+        return p;
+    }
+    // AI yanıtından dosya bloklarını parse et — birden fazla format desteklenir
+    parseChanges(response, originals) {
+        const changes = [];
+        let m;
+        // Format 0 (EN SAĞLAM): <<<FILE: path [| ACTION: x]>>> ...içerik... <<<END>>>
+        // ``` fence opsiyonel — içerik fence'li de fence'siz de yakalanır
+        const fmt0 = /<<<FILE:\s*([^|>\n]+?)\s*(?:\|\s*ACTION:\s*(create|modify|delete)\s*)?>>>([\s\S]*?)<<<END>>>/gi;
+        while ((m = fmt0.exec(response)) !== null) {
+            const path = m[1].trim();
+            const action = m[2]?.trim() || "create";
+            let content = m[3];
+            // İçerik ```dil ... ``` ile sarılıysa fence'i soy
+            const fenced = content.match(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/);
+            if (fenced)
+                content = fenced[1];
+            content = content.replace(/^\n+/, "").replace(/\n+$/, "\n");
+            this.addChange(changes, path, action, content, originals);
+        }
+        if (changes.length > 0)
+            return changes;
+        // Format 2: ## FILE: path\n```...```  veya  // FILE: path\n```...```
+        const fmt2 = /(?:##\s*FILE:|\/\/\s*FILE:|FILE:)\s*([^\n]+)\n```[a-zA-Z0-9]*\n?([\s\S]*?)```/gi;
+        while ((m = fmt2.exec(response)) !== null) {
+            this.addChange(changes, m[1].trim(), "create", m[2], originals);
+        }
+        if (changes.length > 0)
+            return changes;
+        // Format 3: ```typescript (ilk satırda yorum olarak dosya adı)
+        //            // utils/math.js   veya  # utils/math.py
+        const fmt3 = /```[a-zA-Z0-9]*\n(?:\/\/|#)\s*([^\n]+\.[a-zA-Z0-9]+)\n([\s\S]*?)```/gi;
+        while ((m = fmt3.exec(response)) !== null) {
+            this.addChange(changes, m[1].trim(), "create", m[2], originals);
+        }
+        if (changes.length > 0)
+            return changes;
+        // Format 4: Sadece bir kod bloğu varsa ve plan'da hedef dosya varsa oraya yaz
+        const singleBlock = /```[a-zA-Z0-9]*\n([\s\S]+?)```/;
+        const sb = singleBlock.exec(response);
+        if (sb && originals.length === 1) {
+            this.addChange(changes, originals[0].path, "modify", sb[1], originals);
+        }
+        return changes;
+    }
+    addChange(changes, filePath, action, newContent, originals) {
+        const original = originals.find(o => o.path === filePath);
+        changes.push({
+            filePath,
+            action: original ? "modify" : action,
+            originalContent: original?.content,
+            newContent: newContent.replace(/\r\n/g, "\n"),
+            description: original ? `${filePath} güncelleniyor` : `${filePath} oluşturuluyor`,
+        });
+    }
+    extractJson(text) {
+        // ```json ... ``` veya çıplak { ... } bul
+        const fenced = text.match(/```(?:json)?\s*(\{[\s\S]*?\})\s*```/);
+        const raw = fenced ? fenced[1] : (text.match(/\{[\s\S]*\}/)?.[0]);
+        if (!raw)
+            return null;
+        try {
+            return JSON.parse(raw);
+        }
+        catch {
+            return null;
+        }
+    }
+}
+exports.Orchestrator = Orchestrator;
+//# sourceMappingURL=orchestrator.js.map

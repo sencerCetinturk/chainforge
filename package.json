@@ -2,7 +2,7 @@
   "name": "chainforge",
   "displayName": "ChainForge — Multi-Model AI Chat & Agents",
   "description": "AI coding assistant for VS Code. Chat with GPT, Claude, Gemini & 400+ models via OpenRouter. Smart routing, automatic fallback, multi-agent chains.",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "publisher": "sencerCetinturk",
   "license": "MIT",
   "engines": { "vscode": "^1.85.0" },
@@ -45,6 +45,7 @@
     "views": {
       "chainforge": [
         {
+          "type": "webview",
           "id": "chainforgeView",
           "name": "ChainForge"
         }
@@ -57,6 +58,9 @@
         "icon": "icon.svg"
       },
       { "command": "chainforge.runTask", "title": "ChainForge: Run Task" },
+      { "command": "chainforge.agentTask", "title": "ChainForge: Agent Task (Auto Edit Files)" },
+      { "command": "chainforge.inspect", "title": "ChainForge: Inspect Files (Denetmen)" },
+      { "command": "chainforge.inspectReset", "title": "ChainForge: Reset Inspector Checkpoint" },
       { "command": "chainforge.configure", "title": "ChainForge: Configure" }
     ],
     "menus": {
@@ -84,6 +88,21 @@
             "English", "Türkçe", "Deutsch", "Français", "Español", "日本語", "中文"
           ],
           "description": "ChainForge interface language"
+        },
+        "chainforge.telemetryEndpoint": {
+          "type": "string",
+          "default": "",
+          "description": "Anonim telemetri için genel HTTPS endpoint (webhook vb.). Firebase kullanıyorsanız aşağıdaki Firebase alanlarını doldurun."
+        },
+        "chainforge.telemetryFirebaseProjectId": {
+          "type": "string",
+          "default": "",
+          "description": "Firebase proje ID'si (telemetri Firestore'a yazılır). Geliştirici tarafından ayarlanır."
+        },
+        "chainforge.telemetryFirebaseApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Firebase Web API anahtarı. Geliştirici tarafından ayarlanır."
         }
       }
     }
