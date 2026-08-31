@@ -8,7 +8,8 @@ import {
   validateTaskDescription, validateFallback
 } from "./validator";
 
-const DEFAULT_CONFIG: ChainConfig = {
+// "Dengeli" preset ile birebir aynı — presets.ts bunu temel alıp sadece modelleri değiştirir.
+export const DEFAULT_CONFIG: ChainConfig = {
   version: "1.0",
   openRouterKey: "",
   agents: {
@@ -31,7 +32,7 @@ KURALLARIN:
     },
     fallback: {
       name: "Fallback",
-      model: "qwen/qwen3-coder:free",
+      model: "cohere/north-mini-code:free",
       role: "fallback",
       fallback: "supervisor",
       maxRetries: 2,
@@ -41,7 +42,7 @@ GÖREVİN: Kullanıcının isteğini en iyi şekilde yerine getirmek. Kod yaz, s
     },
     supervisor: {
       name: "Denetmen",
-      model: "deepseek/deepseek-chat-v3-0324:free",
+      model: "z-ai/glm-5.2:free",
       role: "supervisor",
       maxRetries: 2,
       // ZİNCİR SONU — fallback YOK. (Önceden "fallback"e dönüyordu = sonsuz halka!)

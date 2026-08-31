@@ -4,8 +4,10 @@ exports.AIChainPanel = void 0;
 const vscode = require("vscode");
 const i18n_1 = require("./i18n");
 const freeModels_1 = require("./freeModels");
+const presets_1 = require("./presets");
+const freeModels_2 = require("./freeModels");
 class AIChainPanel {
-    constructor(extensionUri, config, onTask, onOpenConfig, onSaveKey, onSaveConfig, onActivateLicense, onDeactivateLicense, isPro, lang = "en", licenseKey = "", spendingManager, hasApiKey = false, telemetryConsent = "ask", chatProvider = () => [], chatSummary = { projectCount: 0, totalMessages: 0, currentCount: 0 }) {
+    constructor(extensionUri, config, onTask, onOpenConfig, onSaveKey, onSaveConfig, onActivateLicense, onDeactivateLicense, isPro, lang = "en", licenseKey = "", spendingManager, hasApiKey = false, telemetryConsent = "ask", chatProvider = () => [], chatSummary = { projectCount: 0, totalMessages: 0, currentCount: 0 }, customInstructions = [], saveLang = () => { }, chatModel = "__auto_free__", saveChatModel = () => { }, lastTaskSteps = [], opHistory = [], getLiveFreeModelIds = () => null) {
         this.extensionUri = extensionUri;
         this.config = config;
         this.onTask = onTask;
@@ -22,6 +24,13 @@ class AIChainPanel {
         this.telemetryConsent = telemetryConsent;
         this.chatProvider = chatProvider;
         this.chatSummary = chatSummary;
+        this.customInstructions = customInstructions;
+        this.saveLang = saveLang;
+        this.chatModel = chatModel;
+        this.saveChatModel = saveChatModel;
+        this.lastTaskSteps = lastTaskSteps;
+        this.opHistory = opHistory;
+        this.getLiveFreeModelIds = getLiveFreeModelIds;
         this.disposables = [];
         this.nonce = "";
         this.nonce = this.generateNonce();
@@ -46,7 +55,39 @@ class AIChainPanel {
         }, null, this.disposables);
     }
     focus() {
-        this.view?.show(true);
+        if (this.view?.show)
+            this.view.show(true);
+        else if (this.view?.reveal)
+            this.view.reveal(undefined, true);
+    }
+    // Kenar çubuğundaki dar görünümün alternatifi: aynı paneli büyük, editör alanında bir
+    // sekme olarak açar (chainforge.openFullView komutu). Aynı örneği (this) kullandığı için
+    // config/isPro/customInstructions gibi durum hep senkron kalır — sadece FİZİKSEL webview
+    // hedefi değişir. NOT: aynı anda hem kenar çubuğu hem tam sekme açıksa, sadece EN SON
+    // odaklanan canlı güncelleme alır (basitlik için kabul edilen bir sınırlama).
+    attachWebviewPanel(panel) {
+        this.view = panel;
+        panel.webview.options = {
+            enableScripts: true,
+            localResourceRoots: [this.extensionUri],
+        };
+        this.update();
+        panel.onDidDispose(() => {
+            this.view = undefined;
+            while (this.disposables.length) {
+                const d = this.disposables.pop();
+                if (d)
+                    d.dispose();
+            }
+        }, null, this.disposables);
+        panel.webview.onDidReceiveMessage(async (message) => {
+            await this.handleMessage(message);
+        }, null, this.disposables);
+    }
+    // Dışarıdan (extension.ts) tetiklenen yenileme — fiyat önbelleği geldiğinde,
+    // sohbet temizlendiğinde vb. panelin tamamını (istatistikler dahil) yeniden çizer.
+    refreshView() {
+        this.update();
     }
     generateNonce() {
         let text = "";
@@ -74,6 +115,51 @@ class AIChainPanel {
             case "openConfig":
                 this.onOpenConfig();
                 break;
+            case "revertLastChange": {
+                vscode.commands.executeCommand("chainforge.revertLastChange", (payload) => {
+                    this.view?.webview.postMessage(payload);
+                });
+                break;
+            }
+            case "addCustomInstruction": {
+                if (typeof message.text !== "string")
+                    return;
+                const text = message.text.trim().slice(0, 300);
+                if (!text)
+                    return;
+                if (this.customInstructions.length >= 20) {
+                    this.view?.webview.postMessage({ command: "customInstructionsError", error: "En fazla 20 talimat ekleyebilirsin." });
+                    return;
+                }
+                this.customInstructions = [...this.customInstructions, text];
+                await this.saveCustomInstructions();
+                break;
+            }
+            case "applyPreset": {
+                if (typeof message.key !== "string")
+                    return;
+                const preset = presets_1.PRESETS.find(p => p.key === message.key);
+                if (!preset)
+                    return;
+                if (preset.requiresKey && !this.hasApiKey) {
+                    this.view?.webview.postMessage({ command: "presetError", error: "Bu preset OpenRouter API key gerektirir. Önce Ayarlar'dan key ekle." });
+                    return;
+                }
+                const ans = await vscode.window.showWarningMessage(`"${preset.label}" preseti uygulansın mı? Mevcut worker/fallback/supervisor agent'larının üzerine yazılacak.`, { modal: true }, "Evet, Uygula");
+                if (ans !== "Evet, Uygula")
+                    return;
+                this.config = preset.config;
+                this.onSaveConfig(this.config);
+                this.update();
+                break;
+            }
+            case "removeCustomInstruction": {
+                if (typeof message.index !== "number")
+                    return;
+                this.customInstructions = this.customInstructions.filter((_, i) => i !== message.index);
+                await this.saveCustomInstructions();
+                break;
+            }
             case "agentTask": {
                 if (typeof message.prompt !== "string")
                     return;
@@ -82,13 +168,20 @@ class AIChainPanel {
                 }, this.lang);
                 break;
             }
+            case "saveChatModel": {
+                if (typeof message.model !== "string")
+                    return;
+                this.chatModel = message.model;
+                this.saveChatModel(message.model);
+                break;
+            }
             case "changeLang": {
                 if (typeof message.lang !== "string")
                     return;
                 const validLangs = ["en", "tr", "de", "fr", "es", "ja", "zh"];
                 if (validLangs.includes(message.lang)) {
                     this.lang = message.lang;
-                    vscode.workspace.getConfiguration("chainforge").update("language", message.lang, vscode.ConfigurationTarget.Global);
+                    this.saveLang(message.lang);
                     this.update();
                 }
                 break;
@@ -283,6 +376,10 @@ class AIChainPanel {
                 vscode.commands.executeCommand("chainforge.cancelChat");
                 break;
             }
+            case "cancelAgentTask": {
+                vscode.commands.executeCommand("chainforge.cancelAgentTask");
+                break;
+            }
             case "saveChat": {
                 if (Array.isArray(message.history)) {
                     await vscode.commands.executeCommand("chainforge.saveChat", message.history);
@@ -406,13 +503,51 @@ class AIChainPanel {
             .replace(/"/g, "&quot;")
             .replace(/'/g, "&#x27;");
     }
+    // Geçmişte bu projede uygulanan agent görevlerinin listesi (en yeni üstte)
+    renderOpHistory() {
+        if (this.opHistory.length === 0) {
+            return `<p class="empty" style="margin:4px 0;font-size:11px">Bu projede henüz uygulanmış bir agent görevi yok.</p>`;
+        }
+        const items = [...this.opHistory].reverse().slice(0, 20).map(op => {
+            const date = new Date(op.ts);
+            const when = isNaN(date.getTime()) ? op.ts : date.toLocaleString("tr-TR");
+            const fileCount = op.files?.length || 0;
+            const costPart = typeof op.costUsd === "number" ? ` · $${op.costUsd.toFixed(4)}` : "";
+            return `
+        <div style="padding:6px 0;border-bottom:1px solid var(--vscode-panel-border);font-size:11px">
+          <div style="font-weight:500">${this.escapeHtml(op.summary || op.prompt || "(özet yok)")}</div>
+          <div style="color:var(--vscode-descriptionForeground);margin-top:2px">
+            ${this.escapeHtml(when)} · ${this.escapeHtml(op.model || "?")} · ${fileCount} dosya${costPart}
+          </div>
+        </div>`;
+        }).join("");
+        return `<div style="max-height:260px;overflow-y:auto">${items}</div>`;
+    }
+    // Özel talimatlar listesini (ayarlar > Pro > modal) render eder
+    renderCustomInstructionsList() {
+        if (this.customInstructions.length === 0) {
+            return `<p class="empty" style="margin:4px 0">Henüz talimat eklemedin.</p>`;
+        }
+        return this.customInstructions.map((text, i) => `
+      <div style="display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid var(--vscode-panel-border);font-size:12px">
+        <div style="flex:1;word-break:break-word">${this.escapeHtml(text)}</div>
+        <span data-ci-remove="${i}" title="Kaldır" style="cursor:pointer;color:var(--vscode-descriptionForeground);flex-shrink:0">✕</span>
+      </div>`).join("");
+    }
+    // Diziyi kalıcı ayara yaz + webview'daki listeyi (tam sayfa reload olmadan) güncelle
+    async saveCustomInstructions() {
+        await vscode.workspace.getConfiguration("chainforge").update("customInstructions", this.customInstructions, vscode.ConfigurationTarget.Global);
+        this.view?.webview.postMessage({ command: "customInstructionsList", data: this.renderCustomInstructionsList() });
+    }
     // Sohbet model seçici için option'lar: ücretsiz modeller + kullanıcının agent'ları
     getModelOptions() {
+        const sel = (value) => value === this.chatModel ? " selected" : "";
         let html = `<optgroup label="Ücretsiz (key gerekmez)">`;
-        html += `<option value="__auto_free__">⚡ Otomatik (ücretsiz)</option>`;
-        for (const m of freeModels_1.FREE_MODELS) {
+        html += `<option value="__auto_free__"${sel("__auto_free__")}>⚡ Otomatik (ücretsiz)</option>`;
+        const effectiveFreeModels = (0, freeModels_2.filterAliveModels)(freeModels_1.FREE_MODELS, this.getLiveFreeModelIds());
+        for (const m of effectiveFreeModels) {
             const mark = m.tier === "limited" ? " · sınırlı" : "";
-            html += `<option value="${this.escapeHtml(m.id)}">${this.escapeHtml(m.label)}${mark} — ${this.escapeHtml(m.goodFor)}</option>`;
+            html += `<option value="${this.escapeHtml(m.id)}"${sel(m.id)}>${this.escapeHtml(m.label)}${mark} — ${this.escapeHtml(m.goodFor)}</option>`;
         }
         html += `</optgroup>`;
         if (this.config?.agents && Object.keys(this.config.agents).length > 0) {
@@ -422,7 +557,7 @@ class AIChainPanel {
                 const a = this.config.agents[key];
                 const disabled = !this.isPro && i >= 3; // free: ilk 3 dışı devre dışı
                 const label = `${this.escapeHtml(a.name || key)} (${this.escapeHtml(a.model)})`;
-                html += `<option value="agent:${this.escapeHtml(key)}" ${disabled ? "disabled" : ""}>${label}${disabled ? " 🔒 Pro" : ""}</option>`;
+                html += `<option value="agent:${this.escapeHtml(key)}"${sel("agent:" + key)} ${disabled ? "disabled" : ""}>${label}${disabled ? " 🔒 Pro" : ""}</option>`;
             });
             html += `</optgroup>`;
         }
@@ -674,7 +809,7 @@ a{color:var(--vscode-textLink-foreground)}
       ${langOptions}
     </select>
     ${this.isPro
-            ? `<span class="active-badge">${t('proActive')}</span>`
+            ? `<span class="active-badge" title="Desteğin için teşekkürler!">${t('proActive')}</span>`
             : `<button id="btnShowPro" class="btn-sec" style="font-size:11px">${t('upgradeBtn')}</button>`}
   </div>
 </div>
@@ -694,7 +829,9 @@ a{color:var(--vscode-textLink-foreground)}
     <div class="chat-area" id="chatArea"></div>
 
     <!-- Görev modu sonucu (dosya içerikleri) -->
-    <div class="result-box" id="result" style="display:none">${t('noResult')}</div>
+    <div class="result-box" id="result" style="${this.lastTaskSteps.length > 0 ? "display:block" : "display:none"}">${this.lastTaskSteps.length > 0
+            ? `📋 Son görev adımları (kaydedilmiş):\n\n${this.escapeHtml(this.lastTaskSteps.join("\n"))}`
+            : t('noResult')}</div>
     <div class="meta-row" id="meta" style="display:none">
       <span>${t('modelLabel')} <span id="metaModel"></span></span>
       <span id="metaTokens" style="display:none"><span id="metaTokenCount"></span> token</span>
@@ -705,6 +842,9 @@ a{color:var(--vscode-textLink-foreground)}
     <div class="btn-row" id="saveRow" style="display:none">
       <button id="btnShowSave" class="btn-sec">${t('saveFile')}</button>
       <button id="btnApplyFile" class="btn-sec" title="Editördeki dosyaya uygula">${this.icon('file')} Dosyaya Uygula</button>
+    </div>
+    <div class="btn-row" id="revertRow" style="display:none">
+      <button id="btnRevertLast" class="btn-sec" title="Son uygulanan değişikliği geri al">↩ Son Değişikliği Geri Al</button>
     </div>
 
     <!-- Denetim sonuçları -->
@@ -767,6 +907,18 @@ a{color:var(--vscode-textLink-foreground)}
       </div>
     </div>
   </details>
+  <details class="settings-group" style="margin-bottom:12px">
+    <summary>⚡ Hızlı Kurulum</summary>
+    <div style="padding:10px 12px">
+      <p style="font-size:11px;color:var(--vscode-descriptionForeground);margin-bottom:8px">
+        Bir preset seç — mevcut worker/fallback/supervisor agent'larının <b>üzerine yazılır</b>.
+      </p>
+      <div class="btn-row" style="flex-wrap:wrap">
+        ${presets_1.PRESETS.map(p => `<button class="btn-sec preset-btn" data-preset="${p.key}" title="${this.escapeHtml(p.description)}">${p.label}</button>`).join("")}
+      </div>
+      <div id="presetErr" class="err-msg"></div>
+    </div>
+  </details>
   <div class="sec-label">${t('agentsTitle')}</div>
   <div class="cards-grid" id="agentCards">${this.getAgentCards(t)}</div>
   ${atLimit ? `<p class="limit-note">⚠ ${t('limitNote')}</p>` : ""}
@@ -825,7 +977,10 @@ a{color:var(--vscode-textLink-foreground)}
 
   ${this.isPro ? `
   <div class="divider"></div>
-  <div class="sec-label">${t('proLicenseTitle') || 'Pro License'}</div>
+  <div class="sec-label">${t('proLicenseTitle') || 'Pro License'} <span style="font-weight:400">💙</span></div>
+  <div style="font-size:11px;color:var(--vscode-descriptionForeground);margin-bottom:10px">
+    ChainForge Pro'yu desteklediğin için teşekkürler. Bağımsız bir geliştirici olarak bu satışlar sayesinde projeye devam edebiliyorum.
+  </div>
   <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
     <div style="flex:1;background:var(--vscode-input-background);border:1px solid var(--vscode-input-border);border-radius:4px;padding:6px 10px;font-size:12px;font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
       ${this.licenseKey ? this.licenseKey.slice(0, 4) + "••••••••••••" + this.licenseKey.slice(-4) : "••••••••••••"}
@@ -833,15 +988,37 @@ a{color:var(--vscode-textLink-foreground)}
     <button id="btnCopyKey" class="btn-sec" style="flex-shrink:0;font-size:11px" data-key="${this.escapeHtml(this.licenseKey)}">📋 Kopyala</button>
   </div>
   <div id="copyOk" class="ok-msg">✓ Kopyalandı</div>
+  <button id="btnCustomInstructions" class="btn-sec" style="margin-bottom:8px">✏️ Özel Talimatlarım (Pro)</button>
   <button id="btnDeactivate" class="btn-danger btn-sec">${t('deactivate')}</button>
   ` : ""}
+
+  <!-- ÖZEL TALİMATLAR MODAL (Pro) -->
+  <div class="modal-overlay" id="instructionsModal">
+    <div class="modal">
+      <div class="modal-title">✏️ Özel Talimatlarım</div>
+      <p style="font-size:11px;color:var(--vscode-descriptionForeground);margin-top:0">
+        Buraya eklediğin her satır, her sohbet ve agent görevine otomatik eklenir (kodlama tarzı, tercih ettiğin kütüphaneler, kurallar vb.).
+      </p>
+      <div id="ciList" style="max-height:220px;overflow-y:auto;margin-bottom:10px">
+        ${this.renderCustomInstructionsList()}
+      </div>
+      <div class="key-row">
+        <input id="ciInput" placeholder="Örn: Her zaman TypeScript kullan" maxlength="300" autocomplete="off" />
+        <button id="btnCiAdd">Ekle</button>
+      </div>
+      <div id="ciErr" class="err-msg"></div>
+      <div class="btn-row">
+        <button id="btnCiClose" class="btn-sec">Kapat</button>
+      </div>
+    </div>
+  </div>
 
   <div class="divider"></div>
   <details class="settings-group">
     <summary>${this.icon('shield')} İzinler & Gizlilik</summary>
     <div style="padding:8px 2px 2px">
       <div style="font-size:11px;color:var(--vscode-descriptionForeground);margin-bottom:8px">
-        Anonim hata ve kullanım verileri toolu geliştirmemize yardım eder. Kod, prompt ve API anahtarı asla gönderilmez.
+        Anonim hata ve kullanım verileri toolu geliştirmemize yardım eder (VS Code arayüz dili dahil). Kod, prompt, API anahtarı ve IP adresi asla gönderilmez.
       </div>
       <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;margin-bottom:6px">
         <input type="checkbox" id="telemetryToggle" ${this.telemetryConsent === "granted" ? "checked" : ""} style="width:auto;margin:0" />
@@ -863,6 +1040,13 @@ a{color:var(--vscode-textLink-foreground)}
         <button id="btnClearProjectChat" class="btn-sec">${this.icon('trash')} Bu Projeyi Temizle</button>
         <button id="btnClearAllChat" class="btn-danger btn-sec">${this.icon('trash')} Tüm Sohbetleri Temizle</button>
       </div>
+    </div>
+  </details>
+
+  <details class="settings-group">
+    <summary>${this.icon('agents')} İşlem Geçmişi <span style="font-weight:400;font-size:11px">(${this.opHistory.length})</span></summary>
+    <div style="padding:8px 2px 2px">
+      ${this.renderOpHistory()}
     </div>
   </details>
 
@@ -966,7 +1150,10 @@ a{color:var(--vscode-textLink-foreground)}
         ${t('proFeature2')}<br>
         ${t('proFeature3')}<br>
         ${t('proFeature4')}<br>
-        ${t('proFeature5')}
+        ${t('proFeature5')}<br>
+        ${t('proFeature7')}<br>
+        ${t('proFeature8')}<br>
+        ${t('proFeature6')}
       </div>
     </div>
     <div style="margin-bottom:12px">
@@ -1101,6 +1288,13 @@ a{color:var(--vscode-textLink-foreground)}
     if (lastResult) vscode.postMessage({ command: 'applyToFile', content: lastResult });
   });
 
+  // Son değişikliği geri al
+  var btnRevertLast = document.getElementById('btnRevertLast');
+  if (btnRevertLast) btnRevertLast.addEventListener('click', function() {
+    btnRevertLast.disabled = true;
+    vscode.postMessage({ command: 'revertLastChange' });
+  });
+
   // Stats temizle
   var btnClearStats = document.getElementById('btnClearStats');
   if (btnClearStats) btnClearStats.addEventListener('click', function() {
@@ -1109,9 +1303,15 @@ a{color:var(--vscode-textLink-foreground)}
     }
   });
 
+  var busyMode = ''; // 'chat' | 'agent' — iptal butonunun doğru komutu göndermesi için
+  var modelSelectEl = document.getElementById('modelSelect');
+  if (modelSelectEl) modelSelectEl.addEventListener('change', function() {
+    vscode.postMessage({ command: 'saveChatModel', model: modelSelectEl.value });
+  });
+
   var btnRun = document.getElementById('btnRun');
   if (btnRun) btnRun.addEventListener('click', function() {
-    if (isBusy) { vscode.postMessage({ command: 'cancelChat' }); }
+    if (isBusy) { vscode.postMessage({ command: busyMode === 'agent' ? 'cancelAgentTask' : 'cancelChat' }); }
     else { runTask(); }
   });
 
@@ -1155,6 +1355,7 @@ a{color:var(--vscode-textLink-foreground)}
   // Canlı model/token göstergesi
   var lastUserMsg = ''; // iptal edilince geri yazmak için
   var isBusy = false;
+  var liveSteps = []; // agent görevi sırasında canlı biriken adım listesi (thinking display)
   function selectedModelLabel() {
     var sel = document.getElementById('modelSelect');
     if (!sel) return '';
@@ -1168,8 +1369,10 @@ a{color:var(--vscode-textLink-foreground)}
     el.innerHTML = dot + '<span>' + text + '</span>';
   }
   // Gönder ↔ İptal butonu durumu
-  function setBusy(busy) {
+  function setBusy(busy, mode) {
     isBusy = busy;
+    if (busy && mode) busyMode = mode;
+    if (!busy) busyMode = '';
     var btn = document.getElementById('btnRun');
     if (!btn) return;
     if (busy) {
@@ -1202,13 +1405,15 @@ a{color:var(--vscode-textLink-foreground)}
       document.getElementById('result').style.display = 'none';
       document.getElementById('meta').style.display = 'none';
       document.getElementById('saveRow').style.display = 'none';
+      liveSteps = [];
+      setBusy(true, 'agent');
       vscode.postMessage({ command: 'agentTask', prompt: prompt, applyFiles: true });
     } else {
       // SOHBET MODU — hafızalı, seçili model
       lastUserMsg = prompt;
       chatHistory.push({ role: 'user', content: prompt });
       renderChat(true);
-      setBusy(true);
+      setBusy(true, 'chat');
       vscode.postMessage({ command: 'chat', history: chatHistory, modelId: modelId });
     }
   }
@@ -1270,6 +1475,39 @@ a{color:var(--vscode-textLink-foreground)}
   var btnDeactivate = document.getElementById('btnDeactivate');
   if (btnDeactivate) btnDeactivate.addEventListener('click', function() {
     vscode.postMessage({ command: 'deactivateLicense' });
+  });
+
+  document.querySelectorAll('.preset-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var errEl = document.getElementById('presetErr');
+      if (errEl) errEl.textContent = '';
+      vscode.postMessage({ command: 'applyPreset', key: btn.getAttribute('data-preset') });
+    });
+  });
+
+  var btnCustomInstructions = document.getElementById('btnCustomInstructions');
+  if (btnCustomInstructions) btnCustomInstructions.addEventListener('click', function() {
+    openModal('instructionsModal');
+  });
+  var btnCiClose = document.getElementById('btnCiClose');
+  if (btnCiClose) btnCiClose.addEventListener('click', function() { closeModal('instructionsModal'); });
+  var btnCiAdd = document.getElementById('btnCiAdd');
+  var ciInput = document.getElementById('ciInput');
+  function submitCiAdd() {
+    var val = (ciInput.value || '').trim();
+    document.getElementById('ciErr').textContent = '';
+    if (!val) return;
+    vscode.postMessage({ command: 'addCustomInstruction', text: val });
+    ciInput.value = '';
+  }
+  if (btnCiAdd) btnCiAdd.addEventListener('click', submitCiAdd);
+  if (ciInput) ciInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') submitCiAdd(); });
+  var ciList = document.getElementById('ciList');
+  if (ciList) ciList.addEventListener('click', function(e) {
+    var idx = e.target && e.target.getAttribute && e.target.getAttribute('data-ci-remove');
+    if (idx !== null && idx !== undefined) {
+      vscode.postMessage({ command: 'removeCustomInstruction', index: parseInt(idx, 10) });
+    }
   });
 
   // Links
@@ -1357,7 +1595,7 @@ a{color:var(--vscode-textLink-foreground)}
   function openAgentModal(key) {
     editingAgentKey = key;
     var titleEl = document.getElementById('agentModalTitle');
-    if (titleEl) titleEl.textContent = key ? '${t('agentEdit')}' : '${t('agentNew')}';
+    if (titleEl) titleEl.textContent = key ? ${JSON.stringify(t('agentEdit'))} : ${JSON.stringify(t('agentNew'))};
     document.getElementById('agentKey').disabled = !!key;
     showErr('agentModalErr', '');
     if (key && agents[key]) {
@@ -1419,7 +1657,7 @@ a{color:var(--vscode-textLink-foreground)}
   function openTaskModal(key) {
     editingTaskKey = key;
     var titleEl = document.getElementById('taskModalTitle');
-    if (titleEl) titleEl.textContent = key ? '${t('taskEdit')}' : '${t('taskNew')}';
+    if (titleEl) titleEl.textContent = key ? ${JSON.stringify(t('taskEdit'))} : ${JSON.stringify(t('taskNew'))};
     document.getElementById('taskKey').disabled = !!key;
     showErr('taskModalErr', '');
     if (key && tasks[key]) {
@@ -1523,8 +1761,30 @@ a{color:var(--vscode-textLink-foreground)}
         }
         saveChat();
         break;
+      case 'agentStep':
+        // Postacı'nın anlık adımı — canlı gösterge (thinking display) + biriken adım listesi
+        if (msg.step) {
+          setLive(String(msg.step).replace(/^\s+/, '').slice(0, 80), 'busy');
+          liveSteps.push(String(msg.step));
+          var liveBox = document.getElementById('result');
+          if (liveBox) {
+            liveBox.textContent = liveSteps.join('\\n');
+            liveBox.style.display = 'block';
+            liveBox.scrollTop = liveBox.scrollHeight;
+          }
+        }
+        break;
+      case 'persistentErrors':
+        if (msg.data && msg.data.count > 0) {
+          chatHistory.push({ role: 'info', content: '⚠ ' + msg.data.count + ' dosyada kalıcı hata var (önceki denetimden beri giderilmemiş). "Hataları Düzelt" ile Postacı\\'ya düzelttirebilirsin.' });
+          renderChat(false);
+          saveChat();
+        }
+        break;
       case 'result':
-        // GÖREV modu sonucu (agentTask)
+        // GÖREV modu sonucu (agentTask) — meşgul durumunu her zaman kapat
+        setBusy(false);
+        setLive('', '');
         if (msg.data && msg.data.success) {
           lastResult = msg.data.content;
           // Kısa özet baloncuk + detay result-box'ta
@@ -1536,12 +1796,27 @@ a{color:var(--vscode-textLink-foreground)}
           document.getElementById('metaModel').textContent = msg.data.usedModel || '';
           document.getElementById('meta').style.display = 'flex';
           document.getElementById('saveRow').style.display = 'flex';
+          var revertRow = document.getElementById('revertRow');
+          if (revertRow) revertRow.style.display = msg.data.revertible ? 'flex' : 'none';
+          if (btnRevertLast) btnRevertLast.disabled = false;
         } else {
           chatHistory.push({ role: 'assistant', content: '⚠ ' + ((msg.data && msg.data.error) || i18n.unknownError), error: true });
           renderChat(false);
         }
         saveChat();
         break;
+      case 'revertDone': {
+        var rr = document.getElementById('revertRow');
+        var hasMore = !!(msg.data && msg.data.hasMore);
+        if (rr) rr.style.display = hasMore ? 'flex' : 'none';
+        if (btnRevertLast) btnRevertLast.disabled = false;
+        var ok = msg.data && msg.data.failed && msg.data.failed.length === 0;
+        var extra = hasMore ? ' (daha fazla geri alınabilir — Pro)' : '';
+        chatHistory.push({ role: 'assistant', content: (ok ? '↩ ' : '⚠ ') + (msg.data ? msg.data.reverted : 0) + ' dosya geri alındı.' + extra, error: !ok });
+        renderChat(false);
+        saveChat();
+        break;
+      }
       case 'fileContext':
         var promptEl2 = document.getElementById('prompt');
         if (promptEl2 && msg.content) {
@@ -1575,6 +1850,9 @@ a{color:var(--vscode-textLink-foreground)}
         break;
       case 'licenseActivated':
         closeModal('proModal');
+        chatHistory.push({ role: 'info', content: '🎉 Pro aktif! Tüm agent limitin kalktı, kendi API key\\'ini bağlayabilirsin. Desteğin için gerçekten teşekkürler 💙' });
+        renderChat(false);
+        saveChat();
         break;
       case 'licenseError':
         document.getElementById('licenseLoading').style.display = 'none';
@@ -1583,6 +1861,23 @@ a{color:var(--vscode-textLink-foreground)}
         break;
       case 'licenseDeactivated':
         break;
+      case 'customInstructionsList': {
+        var ciListEl = document.getElementById('ciList');
+        if (ciListEl) ciListEl.innerHTML = msg.data || '';
+        var ciErrEl1 = document.getElementById('ciErr');
+        if (ciErrEl1) ciErrEl1.textContent = '';
+        break;
+      }
+      case 'presetError': {
+        var presetErrEl = document.getElementById('presetErr');
+        if (presetErrEl) presetErrEl.textContent = msg.error || '';
+        break;
+      }
+      case 'customInstructionsError': {
+        var ciErrEl2 = document.getElementById('ciErr');
+        if (ciErrEl2) ciErrEl2.textContent = msg.error || '';
+        break;
+      }
       case 'inspectionProgress':
         if (msg.data) {
           var pct = msg.data.total > 0 ? Math.round(msg.data.checked / msg.data.total * 100) : 0;

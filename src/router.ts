@@ -165,10 +165,11 @@ export class AIRouter {
   }
 
   // Postacı için: belirli bir modeli doğrudan çağır (agent config gerekmez)
-  async callDirect(model: string, systemPrompt: string, userPrompt: string, online = false, signal?: AbortSignal): Promise<{ success: boolean; content: string; error?: string; usage?: any }> {
+  // history verilirse sohbet hafızası olarak kullanılır (chat modunda routing agent'ları için gerekli)
+  async callDirect(model: string, systemPrompt: string, userPrompt: string, online = false, signal?: AbortSignal, history?: ChatMessage[]): Promise<{ success: boolean; content: string; error?: string; usage?: any }> {
     try {
       const agent: AgentConfig = { name: "direct", model, role: "custom", systemPrompt };
-      const res = await this.callModel(agent, userPrompt, online, undefined, 4096, signal);
+      const res = await this.callModel(agent, userPrompt, online, history, 4096, signal);
       return { success: true, content: res.content, usage: res.usage };
     } catch (err: any) {
       return { success: false, content: "", error: err?.message || "Bilinmeyen hata" };
@@ -181,6 +182,13 @@ export class AIRouter {
       if (agent.role === role) return key;
     }
     return null;
+  }
+
+  // Belirli bir role sahip TÜM agent'ları tanımlama sırasıyla döndür (routing için çoklu sıralama)
+  findAllAgentsByRole(role: string): string[] {
+    return Object.entries(this.config.agents)
+      .filter(([, agent]) => agent.role === role)
+      .map(([key]) => key);
   }
 
   async run(prompt: string, taskType: string): Promise<RouterResult> {

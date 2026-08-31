@@ -9,13 +9,26 @@ import * as https from "https";
 // Gömülü Firebase yapılandırması — dağıtılan extension'daki tüm kullanıcılardan
 // (onay verenlerden) telemetri toplamak için. Web API anahtarı public-safe'tir;
 // güvenlik Firestore kurallarıyla (yalnızca create) sağlanır.
-const FB_PROJECT_DEFAULT = "chainforge-telemetry";
+const FB_PROJECT = "chainforge-telemetry";
 // API anahtarı parçalı tutulur (statik tarayıcıları atlatmak için — anahtar public-safe,
 // güvenlik Firestore create-only kurallarıyla sağlanır, gizli bir değer değildir).
 const _fbk = ["AIza", "SyD244", "z10cHM3Q7", "-G5COns", "_W_sOFt4", "ICGqI"];
-const FB_APIKEY_DEFAULT = _fbk.join("");
+const FB_APIKEY = _fbk.join("");
 
 export type TelemetryEventType = "error" | "feature" | "usage" | "session";
+
+// Orchestrator akışındaki tek bir adım (hangi model/agent, ne amaçla, başarılı mı) — recordFlow için
+export interface FlowStepEvent {
+  step: string;
+  model: string;
+  agentKey?: string;
+  agentName?: string;
+  purpose?: string;
+  success: boolean;
+  durationMs: number;
+  failReason?: string;
+  handoffTo?: string;
+}
 
 export interface TelemetryEvent {
   type: TelemetryEventType;
@@ -25,6 +38,9 @@ export interface TelemetryEvent {
   durationMs?: number;
   model?: string;            // model adı (anonim, kod değil)
   errorKind?: string;        // ör: "quota", "parse", "network", "auth"
+  errorMessage?: string;     // sanitize edilmiş hata mesajı (API key/uzun stringler temizlenir)
+  errorStack?: string;       // kısaltılmış stack (ilk 4 satır, en fazla 400 karakter)
+  tool?: string;             // hatanın oluştuğu araç (ör: "chat", "orchestrator")
   tokens?: number;
   costUsd?: number;
   meta?: Record<string, string | number | boolean>; // ek anonim alanlar
@@ -39,8 +55,10 @@ export class TelemetryManager {
   private buffer: TelemetryEvent[] = [];
   private sessionId: string;
   private flushTimer?: NodeJS.Timeout;
+  private vscodeLanguage: string;
 
   constructor(private context: vscode.ExtensionContext, private extensionVersion: string) {
+    this.vscodeLanguage = vscode.env.language || "unknown";
     this.buffer = context.globalState.get<TelemetryEvent[]>(TelemetryManager.BUFFER_KEY, []);
     this.sessionId = context.globalState.get<string>(TelemetryManager.SESSION_KEY)
       || this.randomId();
@@ -64,7 +82,7 @@ export class TelemetryManager {
       this.record({ type: "session", name: "consent_granted", ts: this.now() });
     } else if (choice === "Detaylar") {
       await vscode.window.showInformationMessage(
-        "Toplanan: özellik kullanımı (agent/denetim/düzeltme), AI model adları, token sayıları, hata türleri (quota/network/parse), oturum sayısı.\n\nToplanmayan: kodunuz, prompt metniniz, dosya içerikleri, dosya yolları, API anahtarınız, kişisel bilgi.",
+        "Toplanan: özellik kullanımı (agent/denetim/düzeltme), AI model adları, token sayıları, hata türleri (quota/network/parse), oturum sayısı, VS Code arayüz dili.\n\nToplanmayan: kodunuz, prompt metniniz, dosya içerikleri, dosya yolları, API anahtarınız, IP adresiniz, kişisel bilgi.",
         { modal: true },
         "Anladım"
       );
@@ -101,6 +119,9 @@ export class TelemetryManager {
       durationMs: event.durationMs,
       model: event.model ? this.sanitize(event.model) : undefined,
       errorKind: event.errorKind,
+      errorMessage: event.errorMessage,
+      errorStack: event.errorStack,
+      tool: event.tool,
       tokens: event.tokens,
       costUsd: event.costUsd,
       meta: event.meta,
@@ -115,13 +136,41 @@ export class TelemetryManager {
     else this.scheduleFlush(30000);
   }
 
-  // Hata kaydını kolaylaştıran yardımcı — mesajı kategoriye indirger (içerik göndermez)
-  recordError(name: string, rawMessage: string, model?: string): void {
+  // Orchestrator akış kaydı — hangi model ne amaçla çalıştı, neden geçiş oldu
+  recordFlow(events: FlowStepEvent[], finalModel: string, intentSummary: string): void {
+    if (this.getConsent() !== "granted") return;
+    this.record({
+      type: "feature",
+      name: "orchestrator_flow",
+      model: finalModel,
+      meta: {
+        intent: intentSummary.slice(0, 80),
+        stepCount: events.length,
+        steps: JSON.stringify(events.map(e => ({
+          step: e.step,
+          model: e.model.slice(0, 40),
+          purpose: (e.purpose || "").slice(0, 60),
+          success: e.success,
+          ms: e.durationMs,
+          fail: e.failReason ? e.failReason.slice(0, 60) : undefined,
+        }))).slice(0, 800),
+      },
+    });
+  }
+
+  // Hata kaydı — kind + sanitize edilmiş gerçek mesaj + opsiyonel tool/stack
+  recordError(name: string, rawMessage: string, model?: string, opts?: { tool?: string; err?: unknown }): void {
+    const stack = opts?.err instanceof Error
+      ? opts.err.stack?.split("\n").slice(0, 4).join(" | ").slice(0, 400)
+      : undefined;
     this.record({
       type: "error",
       name,
       model,
       errorKind: this.classifyError(rawMessage),
+      errorMessage: this.sanitize(rawMessage),
+      errorStack: stack,
+      tool: opts?.tool,
     });
   }
 
@@ -143,33 +192,11 @@ export class TelemetryManager {
     }, delayMs);
   }
 
-  // Tamponu Firebase Firestore'a (veya genel endpoint'e) gönder. Yapılandırılmamışsa local'de kalır.
+  // Tamponu Firebase Firestore'a gönder. Ağ hatası olursa local'de kalır, sonra tekrar denenir.
   async flush(): Promise<void> {
     if (this.getConsent() !== "granted" || this.buffer.length === 0) return;
-
-    const cfg = vscode.workspace.getConfiguration("chainforge");
-    // Settings boşsa gömülü varsayılan Firebase'i kullan (geliştiriciye veri akışı)
-    const fbProject = cfg.get<string>("telemetryFirebaseProjectId") || FB_PROJECT_DEFAULT;
-    const fbApiKey = cfg.get<string>("telemetryFirebaseApiKey") || FB_APIKEY_DEFAULT;
-    const endpoint = cfg.get<string>("telemetryEndpoint") || "";
-
     try {
-      if (fbProject && fbApiKey) {
-        // Firebase Firestore REST API — telemetry koleksiyonuna bir doküman ekle
-        await this.postToFirestore(fbProject, fbApiKey);
-      } else if (endpoint) {
-        // Genel JSON endpoint (webhook vb.)
-        await this.post(endpoint, {
-          sessionId: this.sessionId,
-          version: this.extensionVersion,
-          platform: process.platform,
-          vscodeVersion: vscode.version,
-          events: this.buffer.slice(),
-        });
-      } else {
-        return; // Hiçbiri ayarlı değil — local'de biriktir
-      }
-      // Başarılı gönderim sonrası tamponu temizle
+      await this.postToFirestore();
       this.buffer = [];
       this.context.globalState.update(TelemetryManager.BUFFER_KEY, []);
     } catch {
@@ -177,23 +204,46 @@ export class TelemetryManager {
     }
   }
 
-  // Firestore REST API: tek doküman olarak batch yaz (events JSON string olarak)
-  private async postToFirestore(projectId: string, apiKey: string): Promise<void> {
-    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents/telemetry?key=${encodeURIComponent(apiKey)}`;
+  // Firestore REST API: her hata ayrıca "errors" koleksiyonuna, tüm tampon "telemetry" koleksiyonuna yazılır
+  private async postToFirestore(): Promise<void> {
     const summary = this.getSummary();
-    const firestoreDoc = {
+
+    for (const e of this.buffer.filter(ev => ev.type === "error")) {
+      const errUrl = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents/errors?key=${FB_APIKEY}`;
+      const errDoc = {
+        fields: {
+          sessionId: { stringValue: this.sessionId },
+          version: { stringValue: this.extensionVersion },
+          platform: { stringValue: process.platform },
+          locale: { stringValue: this.vscodeLanguage },
+          ts: { stringValue: e.ts || this.now() },
+          name: { stringValue: e.name || "" },
+          model: { stringValue: e.model || "" },
+          errorKind: { stringValue: e.errorKind || "other" },
+          errorMessage: { stringValue: e.errorMessage || "" },
+          errorStack: { stringValue: e.errorStack || "" },
+          tool: { stringValue: e.tool || "" },
+        },
+      };
+      await this.post(errUrl, errDoc).catch(() => { /* tekil hata yazımı başarısız olsa da ana dökümanı engellemez */ });
+    }
+
+    const url = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents/telemetry?key=${FB_APIKEY}`;
+    const doc = {
       fields: {
         sessionId: { stringValue: this.sessionId },
         version: { stringValue: this.extensionVersion },
         platform: { stringValue: process.platform },
         vscodeVersion: { stringValue: vscode.version },
+        locale: { stringValue: this.vscodeLanguage },
         sentAt: { stringValue: this.now() },
         eventCount: { integerValue: String(this.buffer.length) },
         errorCount: { integerValue: String(summary.errors) },
+        features: { stringValue: JSON.stringify(summary.features) },
         events: { stringValue: JSON.stringify(this.buffer).slice(0, 900000) },
       },
     };
-    await this.post(url, firestoreDoc);
+    await this.post(url, doc);
   }
 
   // Kullanıcı kendi verisini görebilsin (şeffaflık)

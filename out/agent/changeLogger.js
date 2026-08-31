@@ -3,14 +3,27 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.ChangeLogger = void 0;
 const vscode = require("vscode");
 // Değişiklikleri git-diff mantığında, tarih-saat damgalı loglar.
-// .chainforge/logs/changes/ klasörüne JSON + okunabilir diff yazar.
+// globalStorageUri/chainforge-logs/<workspaceKey>/changes/ klasörüne yazar.
+// Workspace bağımsız — proje klasörü taşınsa/yeniden adlandırılsa bile geçmiş kaybolmaz,
+// kullanıcının kendi repo'suna ".chainforge" klasörü de eklenmez.
 class ChangeLogger {
-    constructor() {
+    constructor(context) {
         this.logDir = null;
         const folders = vscode.workspace.workspaceFolders;
-        if (folders) {
+        if (context && folders) {
+            const wsKey = this.sanitizeKey(folders[0].uri.fsPath);
+            this.logDir = vscode.Uri.joinPath(context.globalStorageUri, "chainforge-logs", wsKey, "changes");
+        }
+        else if (folders) {
+            // Geriye dönük uyumluluk: context verilmezse eski (workspace-relative) davranış
             this.logDir = vscode.Uri.joinPath(folders[0].uri, ".chainforge", "logs", "changes");
         }
+    }
+    getLogDir() {
+        return this.logDir?.fsPath ?? null;
+    }
+    sanitizeKey(fsPath) {
+        return fsPath.replace(/[:\\/]/g, "_").replace(/[^a-zA-Z0-9_\-]/g, "_").slice(-80);
     }
     // Tek bir dosya değişikliğini logla
     async log(change, agentKey, model, intent) {
@@ -27,6 +40,7 @@ class ChangeLogger {
             linesAdded: added,
             linesRemoved: removed,
             diff,
+            newContent: change.newContent,
             intent,
         };
         await this.ensureDir();

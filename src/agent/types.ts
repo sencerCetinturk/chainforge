@@ -7,6 +7,10 @@ export interface TaskPlan {
   targetFiles: string[];         // Düzenlenecek dosyalar (workspace-relative)
   intent: string;                // Kullanıcının ne istediğinin özeti
   searchQuery?: string;          // Araştırma sorgusu
+  // MALİYET OPTİMİZASYONU: var olan dosyalar için (varsa) sadece ilgili birebir kod alıntısı.
+  // Coding agent'a dosyanın TAMAMI yerine sadece bu blok gönderilir. Bulunamazsa/doğrulanamazsa
+  // o dosya için tam-dosya moduna güvenle düşülür (bkz. orchestrator.ts: findExcerptFor).
+  fileExcerpts?: { path: string; excerpt: string }[];
 }
 
 // Bir AI'dan toplanan ön bilgi (araştırma/matematik sonucu)
@@ -37,6 +41,7 @@ export interface OrchestratorResult {
   codingModel: string;
   attempts: string[];            // denenen agent zinciri
   rawResponse?: string;          // AI'nın ham yanıtı (debug)
+  flowEvents?: import("../telemetry").FlowStepEvent[]; // hangi model/agent ne amaçla çalıştı (telemetri için)
 }
 
 // Change log girdisi (git-diff mantığı)
@@ -49,6 +54,7 @@ export interface ChangeLogEntry {
   linesAdded: number;
   linesRemoved: number;
   diff: string;                  // unified diff metni
+  newContent?: string;           // tam yeni içerik (Denetmen dosya silinmiş/taşınmış olsa bile analiz edebilsin diye)
   intent: string;                // bu değişikliği tetikleyen istek
 }
 

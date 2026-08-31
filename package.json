@@ -1,8 +1,8 @@
 {
   "name": "chainforge",
   "displayName": "ChainForge — Multi-Model AI Chat & Agents",
-  "description": "AI coding assistant for VS Code. Chat with GPT, Claude, Gemini & 400+ models via OpenRouter. Smart routing, automatic fallback, multi-agent chains.",
-  "version": "1.3.0",
+  "description": "AI coding assistant for VS Code. Chat, auto-edit files, and run a self-healing inspect/fix loop with 400+ models (GPT, Claude, Gemini, DeepSeek) via OpenRouter. Smart routing, automatic fallback, free-tier included.",
+  "version": "1.4.2",
   "publisher": "sencerCetinturk",
   "license": "MIT",
   "engines": {
@@ -58,7 +58,7 @@
         {
           "id": "chainforge",
           "title": "ChainForge",
-          "icon": "icon.svg"
+          "icon": "icon-activitybar.svg"
         }
       ]
     },
@@ -75,7 +75,16 @@
       {
         "command": "chainforge.openPanel",
         "title": "ChainForge: Open Panel",
-        "icon": "icon.svg"
+        "icon": "icon-activitybar.svg"
+      },
+      {
+        "command": "chainforge.openFullView",
+        "title": "ChainForge: Büyük Görünümde Aç (Editör Sekmesi)",
+        "icon": "icon-activitybar.svg"
+      },
+      {
+        "command": "chainforge.agentTaskFromSelection",
+        "title": "ChainForge: Seçili Kodla Görev Başlat"
       },
       {
         "command": "chainforge.runTask",
@@ -98,12 +107,63 @@
         "title": "ChainForge: Configure"
       }
     ],
+    "walkthroughs": [
+      {
+        "id": "chainforgeGettingStarted",
+        "title": "ChainForge'a Başlarken",
+        "description": "Ücretsiz modellerle sohbet et, agent ile dosya düzenlet, kodunu otomatik denetlet.",
+        "icon": "icon.svg",
+        "steps": [
+          {
+            "id": "connectKey",
+            "title": "API Key Bağla (opsiyonel)",
+            "description": "Ücretsiz modellerle key olmadan da başlayabilirsin.",
+            "media": { "markdown": "walkthrough/01-connect-key.md" }
+          },
+          {
+            "id": "chat",
+            "title": "Sohbet Et",
+            "description": "Projeni otomatik okuyan bir AI asistanla konuş.",
+            "media": { "markdown": "walkthrough/02-chat.md" },
+            "completionEvents": ["onCommand:chainforge.openPanel"]
+          },
+          {
+            "id": "agentTask",
+            "title": "Agent İle Dosya Düzenlet",
+            "description": "Görevini yaz, diff'i onayla, ChainForge uygulasın.",
+            "media": { "markdown": "walkthrough/03-agent-task.md" },
+            "completionEvents": ["onCommand:chainforge.agentTask"]
+          },
+          {
+            "id": "inspector",
+            "title": "Denetmen İle Tara",
+            "description": "Kodundaki hataları bul, Postacı otomatik düzeltsin.",
+            "media": { "markdown": "walkthrough/04-inspector.md" },
+            "completionEvents": ["onCommand:chainforge.inspect"]
+          }
+        ]
+      }
+    ],
     "menus": {
       "editor/title": [
         {
           "command": "chainforge.openPanel",
           "group": "navigation",
           "when": "true"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "chainforge.openFullView",
+          "when": "view == chainforgeView",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "chainforge.agentTaskFromSelection",
+          "group": "chainforge",
+          "when": "editorTextFocus"
         }
       ]
     },
@@ -115,28 +175,21 @@
           "default": "",
           "description": "OpenRouter API Key — get yours free at openrouter.ai"
         },
-        "chainforge.language": {
-          "type": "string",
-          "default": "en",
-          "enum": [
-            "en",
-            "tr",
-            "de",
-            "fr",
-            "es",
-            "ja",
-            "zh"
-          ],
-          "enumDescriptions": [
-            "English",
-            "Türkçe",
-            "Deutsch",
-            "Français",
-            "Español",
-            "日本語",
-            "中文"
-          ],
-          "description": "ChainForge interface language"
+        "chainforge.customInstructions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "PRO: Her sohbet ve agent görevine otomatik eklenecek kişisel talimatlarınız (örn. kodlama tarzı, tercih ettiğiniz kütüphaneler). Panelde Ayarlar > Pro License > \"Özel Talimatlarım\" üzerinden düzenlenir. Sadece Pro lisansla aktif olur."
+        },
+        "chainforge.monthlyBudgetUsd": {
+          "type": "number",
+          "default": 0,
+          "description": "Aylık tahmini harcama tavanı (USD). 0 = sınırsız. Bu değere ulaşıldığında/aşıldığında uyarı gösterilir."
+        },
+        "chainforge.autoCheckpoint": {
+          "type": "boolean",
+          "default": false,
+          "description": "Ajan dosyaları değiştirmeden önce, workspace'te commit edilmemiş değişiklikler varsa bunları otomatik bir git checkpoint commit'i olarak kaydet. Kapalıyken sadece uyarı gösterilir."
         },
         "chainforge.telemetryEndpoint": {
           "type": "string",
@@ -158,7 +211,8 @@
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "tsc -p . && node --test"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

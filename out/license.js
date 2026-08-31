@@ -54,9 +54,6 @@ class LicenseManager {
         const isPro = this.context.globalState.get(LicenseManager.IS_PRO_KEY, false);
         if (!savedKey || !isPro)
             return false;
-        // Dev bypass key — network'e gitme
-        if (savedKey === "CHAINFORGE-DEV-2026")
-            return true;
         try {
             const activationId = this.context.globalState.get(LicenseManager.ACTIVATION_KEY);
             const body = { license_key: savedKey };
@@ -76,12 +73,6 @@ class LicenseManager {
         const key = licenseKey.trim();
         if (!key || key.length < 5)
             return { valid: false, error: "Geçersiz lisans key" };
-        // Dev bypass
-        if (key === "CHAINFORGE-DEV-2026") {
-            await this.context.globalState.update(LicenseManager.STORAGE_KEY, key);
-            await this.context.globalState.update(LicenseManager.IS_PRO_KEY, true);
-            return { valid: true };
-        }
         try {
             const data = await httpsPost(DODO_API_URL, "/licenses/activate", {
                 license_key: key,
@@ -113,7 +104,7 @@ class LicenseManager {
     async deactivateLicense() {
         const savedKey = this.context.globalState.get(LicenseManager.STORAGE_KEY);
         const activationId = this.context.globalState.get(LicenseManager.ACTIVATION_KEY);
-        if (savedKey && activationId && savedKey !== "CHAINFORGE-DEV-2026") {
+        if (savedKey && activationId) {
             try {
                 await httpsPost(DODO_API_URL, "/licenses/deactivate", {
                     license_key: savedKey,

@@ -6,22 +6,27 @@ const vscode = require("vscode");
 // - Agentler bölümünde "supervisor" rolüyle tanımlanan AI'yı kullanır
 // - İlk çalıştırma: TÜM dosyaları analiz eder
 // - Sonraki: son kontrolden BERİ değişen dosyaları kontrol eder
-// - Tek bir rapor dosyasına yazar (.chainforge/logs/inspections/rapor_*.txt)
+// - Tek bir rapor dosyasına yazar (globalStorage/chainforge-logs/.../inspections/rapor_*.txt)
 // - En yetkili agent'tır — sadece çıkılamaz durumda koda müdahale eder
 class Inspector {
-    constructor(router, scanner, changeLogger, context, log, onProgress) {
+    constructor(router, scanner, changeLogger, context, log, onProgress, onPersistentErrors // Postacı'ya ping
+    ) {
         this.router = router;
         this.scanner = scanner;
         this.changeLogger = changeLogger;
         this.context = context;
         this.log = log;
         this.onProgress = onProgress;
+        this.onPersistentErrors = onPersistentErrors;
         this.logDir = null;
+        this.persistentErrorDir = null;
         this.agentKey = null;
         this.agentConfig = null;
         const folders = vscode.workspace.workspaceFolders;
         if (folders) {
-            this.logDir = vscode.Uri.joinPath(folders[0].uri, ".chainforge", "logs", "inspections");
+            const wsKey = folders[0].uri.fsPath.replace(/[:\\/]/g, "_").replace(/[^a-zA-Z0-9_\-]/g, "_").slice(-80);
+            this.logDir = vscode.Uri.joinPath(context.globalStorageUri, "chainforge-logs", wsKey, "inspections");
+            this.persistentErrorDir = vscode.Uri.joinPath(context.globalStorageUri, "chainforge-logs", wsKey, "persistent-errors");
         }
         // Agentler bölümünden denetmeni bul
         this.resolveAgent();
@@ -123,8 +128,13 @@ class Inspector {
                     changedPaths.add(f.path);
             }
             const changeEntries = await this.changeLogger.readSince(lastCheck);
-            for (const e of changeEntries)
+            // Log'dan en son içeriği al (disk yerine) — dosya silinmiş/taşınmış olsa bile çalışır
+            const latestContentFromLog = new Map();
+            for (const e of changeEntries) {
                 changedPaths.add(e.filePath);
+                if (e.newContent)
+                    latestContentFromLog.set(e.filePath, e.newContent);
+            }
             const prevErrors = await this.getRecentErrors(lastCheck);
             for (const pe of prevErrors) {
                 if (pe.status === "error")
@@ -132,8 +142,9 @@ class Inspector {
             }
             this.log(`${changedPaths.size} değişen dosya taranıyor…`);
             for (const p of changedPaths) {
-                const content = await this.scanner.readFile(p);
-                if (content !== null)
+                // Önce log'dan al, yoksa diskten oku
+                const content = latestContentFromLog.get(p) ?? await this.scanner.readFile(p);
+                if (content !== null && content !== undefined)
                     filesToCheck.push({ path: p, content });
             }
         }
@@ -157,8 +168,10 @@ class Inspector {
                 this.log(`   ✅ ${file.path} — temiz`);
             }
         }
-        // Rapor dosyası yazıldığı için ayrıca checkpoint güncellemeye gerek yok
-        // Sonraki tarama, rapor dosyasının zaman damgasına bakarak karar verir
+        // Persistent hata tespiti: önceki raporda DA hatalı olan dosyalar → Postacı'ya ping
+        if (lastCheck && allResults.length > 0) {
+            await this.detectAndSavePersistentErrors(allResults, lastCheck);
+        }
         return { checked: filesToCheck.length, errors: errorCount, clean: cleanCount, results: allResults };
     }
     // Tek dosyayı DENETMEN agent'ı (supervisor) ile analiz et
@@ -359,6 +372,60 @@ SADECE JSON formatında yanıtla (başka hiçbir şey yazma):
         };
         await vscode.workspace.fs.writeFile(jsonPath, Buffer.from(JSON.stringify(jsonReport, null, 2), "utf8"));
         return reportText;
+    }
+    // Önceki raporda DA hatalı olan dosyaları persistent-errors/ klasörüne yaz ve Postacı'ya ping at
+    async detectAndSavePersistentErrors(currentResults, lastCheck) {
+        if (!this.persistentErrorDir || !this.logDir)
+            return;
+        // Önceki rapordan hatalı dosyaları oku — lastCheck'TEN ÖNCEKİ en son raporu bul
+        const prevErrorPaths = new Set();
+        try {
+            const files = await vscode.workspace.fs.readDirectory(this.logDir);
+            const sinceKey = lastCheck.replace("T", "_").replace(/:/g, "-");
+            let prevReport = "";
+            for (const [name] of files) {
+                const m = name.match(/^rapor_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.json$/);
+                if (m && m[1] < sinceKey && m[1] > prevReport)
+                    prevReport = m[1];
+            }
+            if (prevReport) {
+                const uri = vscode.Uri.joinPath(this.logDir, `rapor_${prevReport}.json`);
+                const raw = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
+                const parsed = JSON.parse(raw);
+                for (const f of (parsed.files || [])) {
+                    if (f.status === "error")
+                        prevErrorPaths.add(f.path);
+                }
+            }
+        }
+        catch {
+            return;
+        }
+        if (prevErrorPaths.size === 0)
+            return;
+        // Hem önceki hem bu denetimde hatalı olan dosyalar → persistent (kalıcı)
+        const persistent = currentResults.filter(r => r.status === "error" && prevErrorPaths.has(r.filePath));
+        if (persistent.length === 0)
+            return;
+        this.log(`\n⚠ ${persistent.length} kalıcı hata tespit edildi (önceki denetimden beri giderilmemiş):`);
+        for (const p of persistent)
+            this.log(`   🔴 ${p.filePath}`);
+        try {
+            await vscode.workspace.fs.createDirectory(this.persistentErrorDir);
+        }
+        catch { /* var */ }
+        const ts = this.now().replace("T", "_").replace(/:/g, "-");
+        const entry = {
+            timestamp: this.now(),
+            detectedAt: ts,
+            files: persistent.map(r => ({ path: r.filePath, issueCount: r.issues.length, issues: r.issues })),
+        };
+        const uri = vscode.Uri.joinPath(this.persistentErrorDir, `persistent_${ts}.json`);
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(JSON.stringify(entry, null, 2), "utf8"));
+        this.log(`   📁 Kalıcı hata raporu: ${uri.fsPath}`);
+        // Postacı'ya ping at
+        const paths = persistent.map(r => r.filePath);
+        this.onPersistentErrors?.(paths);
     }
     // Son kontrolden beri kayıtlı hataları oku
     async getRecentErrors(sinceTimestamp) {

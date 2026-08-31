@@ -1,11 +1,12 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ConfigManager = void 0;
+exports.ConfigManager = exports.DEFAULT_CONFIG = void 0;
 const vscode = require("vscode");
 const fs = require("fs");
 const path = require("path");
 const validator_1 = require("./validator");
-const DEFAULT_CONFIG = {
+// "Dengeli" preset ile birebir aynı — presets.ts bunu temel alıp sadece modelleri değiştirir.
+exports.DEFAULT_CONFIG = {
     version: "1.0",
     openRouterKey: "",
     agents: {
@@ -28,7 +29,7 @@ KURALLARIN:
         },
         fallback: {
             name: "Fallback",
-            model: "qwen/qwen3-coder:free",
+            model: "cohere/north-mini-code:free",
             role: "fallback",
             fallback: "supervisor",
             maxRetries: 2,
@@ -38,7 +39,7 @@ GÖREVİN: Kullanıcının isteğini en iyi şekilde yerine getirmek. Kod yaz, s
         },
         supervisor: {
             name: "Denetmen",
-            model: "deepseek/deepseek-chat-v3-0324:free",
+            model: "z-ai/glm-5.2:free",
             role: "supervisor",
             maxRetries: 2,
             // ZİNCİR SONU — fallback YOK. (Önceden "fallback"e dönüyordu = sonsuz halka!)
@@ -184,8 +185,8 @@ class ConfigManager {
         try {
             const configPath = this.getConfigPath();
             if (!fs.existsSync(configPath)) {
-                await this.saveConfig(DEFAULT_CONFIG);
-                return { ...DEFAULT_CONFIG };
+                await this.saveConfig(exports.DEFAULT_CONFIG);
+                return { ...exports.DEFAULT_CONFIG };
             }
             const raw = fs.readFileSync(configPath, "utf8");
             const parsed = JSON.parse(raw);
@@ -196,7 +197,7 @@ class ConfigManager {
             return config;
         }
         catch {
-            return { ...DEFAULT_CONFIG };
+            return { ...exports.DEFAULT_CONFIG };
         }
     }
     async saveConfig(config) {
@@ -302,7 +303,7 @@ class ConfigManager {
     async openConfigFile() {
         const configPath = this.getConfigPath();
         if (!fs.existsSync(configPath))
-            await this.saveConfig(DEFAULT_CONFIG);
+            await this.saveConfig(exports.DEFAULT_CONFIG);
         const doc = await vscode.workspace.openTextDocument(configPath);
         await vscode.window.showTextDocument(doc);
     }

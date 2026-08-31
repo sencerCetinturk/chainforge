@@ -6,13 +6,17 @@ import { LicenseManager } from "./license";
 import { SpendingManager, estimateCost, refreshPricingCache } from "./spending";
 import { ChatStore } from "./chatStore";
 import { TelemetryManager } from "./telemetry";
-import { FREE_FALLBACK_CHAIN, getFreeModel } from "./freeModels";
+import { FREE_FALLBACK_CHAIN, FREE_MODELS, getFreeModel, filterAliveChain, filterAliveModels } from "./freeModels";
+import { refreshFreeModelCatalog } from "./modelCatalog";
 import { Language } from "./i18n";
 import { Orchestrator } from "./agent/orchestrator";
 import { WorkspaceScanner } from "./agent/workspaceScanner";
 import { ChangeLogger } from "./agent/changeLogger";
+import { CodeIndexStore } from "./agent/codeIndex";
 import { FileApplier } from "./agent/fileApplier";
 import { Inspector } from "./agent/inspector";
+import { UndoStore } from "./agent/undoStore";
+import { FileChange } from "./agent/types";
 
 let router: AIRouter | null = null;
 let configManager: ConfigManager | null = null;
@@ -22,6 +26,24 @@ let telemetry: TelemetryManager | null = null;
 let chatStore: ChatStore | null = null;
 let chainPanel: AIChainPanel | null = null;
 let activeChatAbort: AbortController | null = null; // sohbet iptali için
+let activeAgentAbort: AbortController | null = null; // agent task iptali için
+// OpenRouter'ın canlı :free kataloğuna göre doğrulanmış model ID'leri — extension açılışında
+// bir kez çekilir (modelCatalog.ts). null = henüz çekilmedi/ağ hatası → statik listeye düş.
+let liveFreeModelIds: Set<string> | null = null;
+// Şu an sürmekte olan bir görevin GERÇEK maliyetini (o göreve ait tüm AI çağrılarının toplamı)
+// izlemek için — recordUsage bu aktifken maliyeti buraya da ekler.
+let activeTaskCost: { active: boolean; total: number } | null = null;
+// "Geri Al" geçmişi — diskte kalıcı (globalStorage/chainforge-logs/.../undo/), pencere kapansa da kaybolmaz.
+// Free: sadece son 1 batch. Pro: son 20 batch (çoklu undo).
+// NOT: UndoStore workspace klasörünü constructor'da okur, bu yüzden ChangeLogger deseninde
+// olduğu gibi HER kullanımda taze bir örnek oluşturulur (tekil/singleton yapılmaz).
+const MAX_UNDO_HISTORY_PRO = 20;
+
+async function pushAppliedBatch(context: vscode.ExtensionContext, batch: FileChange[]): Promise<void> {
+  if (batch.length === 0) return;
+  const pro = (await licenseManager?.isPro()) || false;
+  await new UndoStore(context).push(batch, pro ? MAX_UNDO_HISTORY_PRO : 1);
+}
 
 // Model ID'yi kısa okunur ada çevir (UI canlı gösterge için)
 function shortModel(id: string): string {
@@ -45,6 +67,53 @@ function simplifyError(raw: string): string {
 }
 
 // Seçilen dile göre AI sistem promptu oluşturur
+// PRO ÖZELLİĞİ: kullanıcının tanımladığı özel talimatlar her chat/agent görevine otomatik eklenir.
+// Free kullanıcıda ayar dolu olsa bile uygulanmaz (isPro kontrolü çağıran tarafta yapılır).
+// Takım/proje bazlı paylaşılabilir talimatlar: workspace kökünde ".chainforge/instructions.md"
+// varsa (repo'ya committ edilip takımla paylaşılabilir) okunur. Kişisel talimatlarla (VS Code
+// ayarları, sadece bu makinede) birleştirilir — proje talimatları önce gelir.
+async function getProjectInstructions(): Promise<string> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders) return "";
+  try {
+    const uri = vscode.Uri.joinPath(folders[0].uri, ".chainforge", "instructions.md");
+    const raw = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
+    return raw.trim().slice(0, 4000);
+  } catch {
+    return ""; // dosya yok — normal, çoğu proje için beklenen durum
+  }
+}
+
+async function getCustomInstructions(): Promise<string> {
+  const isPro = (await licenseManager?.isPro()) || false;
+  if (!isPro) return "";
+  const list = vscode.workspace.getConfiguration("chainforge").get<string[]>("customInstructions") || [];
+  const personal = list.filter(s => s && s.trim()).map(s => `- ${s.trim()}`).join("\n").slice(0, 4000);
+  const project = await getProjectInstructions();
+  const parts: string[] = [];
+  if (project) parts.push(`[PROJE TALİMATLARI — .chainforge/instructions.md]\n${project}`);
+  if (personal) parts.push(`[KİŞİSEL TALİMATLAR]\n${personal}`);
+  return parts.join("\n\n");
+}
+
+// Uygulanan dosya değişikliklerinden ucuz bir ücretsiz modelle conventional-commits formatında
+// tek satırlık bir commit mesajı üretir. Tam diff yerine sadece dosya adı+aksiyon + görev
+// niyeti gönderilir — hem ucuz hem genelde yeterli bağlam sağlar.
+async function generateCommitMessage(changes: FileChange[], intent: string): Promise<string | null> {
+  if (!router) return null;
+  const model = filterAliveChain(FREE_FALLBACK_CHAIN, liveFreeModelIds)[0];
+  if (!model) return null;
+  const fileList = changes.map(c => `${c.action}: ${c.filePath}`).join("\n");
+  const prompt = `Şu görev ve değişen dosyalara göre, conventional commits formatında (feat/fix/refactor/chore + kısa açıklama), İNGİLİZCE, TEK SATIRLIK bir git commit mesajı yaz. SADECE mesajı yaz, tırnak/açıklama ekleme.\n\nGörev: ${intent}\n\nDosyalar:\n${fileList}`;
+  try {
+    const res = await router.callDirect(model, "Sen kısa, net commit mesajları yazan bir asistansın.", prompt, false);
+    if (!res.success || !res.content.trim()) return null;
+    return res.content.trim().split("\n")[0].replace(/^["'`]+|["'`]+$/g, "").slice(0, 200);
+  } catch {
+    return null;
+  }
+}
+
 function getChatSystemPrompt(lang: string): string {
   switch (lang) {
     case "tr": return "Sen yardımcı bir kod ve geliştirme asistanısın. Net, doğru ve özlü yanıt ver. Türkçe yanıt ver.";
@@ -73,8 +142,25 @@ export async function activate(context: vscode.ExtensionContext) {
   configManager = new ConfigManager(context);
   licenseManager = new LicenseManager(context);
   spendingManager = new SpendingManager(context);
-  refreshPricingCache(context); // OpenRouter'dan güncel fiyatları arka planda çek (token harcamaz)
+  // OpenRouter'dan güncel fiyatları arka planda çek (token harcamaz); gelince stats'ı yenile
+  refreshPricingCache(context).then(() => chainPanel?.refreshView()).catch(() => {});
   chatStore = new ChatStore(context);
+
+  // MULTI-ROOT UYARISI: ChainForge şu an sadece ilk workspace klasörünü kullanıyor
+  // (workspaceScanner, fileApplier, changeLogger, undoStore hep folders[0]'a yazar/okur).
+  // Bunu gizlemek yerine kullanıcıya açıkça söylüyoruz.
+  const warnIfMultiRoot = () => {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders || folders.length <= 1) return;
+    const key = `chainforge.multiRootWarned.${folders.length}`;
+    if (context.globalState.get(key)) return;
+    context.globalState.update(key, true);
+    vscode.window.showInformationMessage(
+      `ChainForge şu an yalnızca ilk workspace klasörünü ("${folders[0].name}") kullanıyor. Çoklu-root desteği henüz yok.`
+    );
+  };
+  warnIfMultiRoot();
+  context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(warnIfMultiRoot));
 
   const version = (context.extension?.packageJSON?.version as string) || "0.0.0";
   telemetry = new TelemetryManager(context, version);
@@ -83,9 +169,29 @@ export async function activate(context: vscode.ExtensionContext) {
   telemetry.record({ type: "session", name: "activate" });
   telemetry.ensureConsent();
 
+  // Sürüm güncelleme bildirimi — yeni versiyon ilk açılışında "Yenilikler" göster
+  const lastSeenVersion = context.globalState.get<string>("chainforge.lastSeenVersion", "");
+  if (lastSeenVersion && lastSeenVersion !== version) {
+    const changelog: Record<string, string> = {
+      "1.4.2": "• Path traversal ve lisans bypass güvenlik açıkları kapatıldı\n• Tek tık \"Geri Al\" (Pro: sınırsız geçmiş)\n• Özel Global Talimatlar (Pro)\n• Aylık harcama tavanı ve git-kirli uyarısı\n• Hızlı Kurulum preset'leri, onboarding turu\n• Çoklu routing agent desteği ve öncelik sırası\n• Denetmen ↔ Postacı otomatik hata giderme döngüsü (kalıcı hata tespiti)",
+    };
+    const notes = changelog[version] || "Hata düzeltmeleri ve iyileştirmeler.";
+    vscode.window.showInformationMessage(`ChainForge ${version} — Yenilikler:\n${notes}`, "Tamam");
+  }
+  context.globalState.update("chainforge.lastSeenVersion", version);
+
+  // Ücretsiz model kataloğunu OpenRouter'ın canlı listesine karşı doğrula (key gerekmez,
+  // 24 saat önbelleklenir). Statik listelerdeki (freeModels.ts) modeller zamanla ölebiliyor —
+  // bu, ölü modellere düşmeyi önler. Arka planda çalışır, hazır olunca paneli tazeler.
+  refreshFreeModelCatalog(context).then(ids => {
+    liveFreeModelIds = ids;
+    chainPanel?.refreshView();
+  });
+
   // Her AI çağrısının token kullanımını otomatik kaydet (orchestrator, inspector, fixErrors dahil)
   const recordUsage = (model: string, usage: { promptTokens: number; completionTokens: number; totalTokens: number }) => {
     const cost = estimateCost(model, usage.promptTokens, usage.completionTokens);
+    if (activeTaskCost?.active) activeTaskCost.total += cost;
     spendingManager!.addRecord({
       timestamp: Date.now(),
       model,
@@ -96,6 +202,33 @@ export async function activate(context: vscode.ExtensionContext) {
     });
     // Anonim kullanım telemetrisi (model adı + token sayısı, içerik değil)
     telemetry?.record({ type: "usage", name: "ai_call", model, tokens: usage.totalTokens, costUsd: cost });
+    checkBudgetThreshold(context);
+  };
+
+  // Aylık harcama tavanına yaklaşıldığında/aşıldığında bir kez uyar (spam yapmaz)
+  const checkBudgetThreshold = (ctx: vscode.ExtensionContext) => {
+    const budget = vscode.workspace.getConfiguration("chainforge").get<number>("monthlyBudgetUsd") || 0;
+    if (budget <= 0 || !spendingManager) return;
+    const stats = spendingManager.getMonthlyStats();
+    const ratio = stats.totalCost / budget;
+    const warnKey = (pct: number) => `chainforge.budgetWarned.${stats.month}.${pct}`;
+    if (ratio >= 1 && !ctx.globalState.get(warnKey(100))) {
+      ctx.globalState.update(warnKey(100), true);
+      vscode.window.showWarningMessage(`ChainForge: Aylık tahmini harcama $${stats.totalCost.toFixed(2)} — belirlediğiniz $${budget} tavanı aşıldı.`);
+    } else if (ratio >= 0.8 && !ctx.globalState.get(warnKey(80))) {
+      ctx.globalState.update(warnKey(80), true);
+      vscode.window.showInformationMessage(`ChainForge: Aylık tahmini harcama $${stats.totalCost.toFixed(2)} — $${budget} tavanının %80'ine ulaştı.`);
+    }
+  };
+
+  // Dil ayarı — hesaba bağlı, globalState'te (workspace'ten ve vscode ayarlarından bağımsız,
+  // böylece farklı klasörden açılsa bile kullanıcının seçimi kalıcı olur)
+  const getLang = (): Language => {
+    return (context.globalState.get<string>("chainforge.language") || "en") as Language;
+  };
+  const saveLang = (lang: string) => {
+    context.globalState.update("chainforge.language", lang);
+    router?.setLanguageHint(lang);
   };
 
   // Router oluşturulduğunda token kancasını + Pro durumunu + dil ayarını bağla
@@ -103,15 +236,19 @@ export async function activate(context: vscode.ExtensionContext) {
     const r = new AIRouter(cfg);
     r.setUsageSink(recordUsage);
     licenseManager!.isPro().then(pro => r.setProStatus(pro));
-    const savedLang = vscode.workspace.getConfiguration("chainforge").get<string>("language") || "en";
-    r.setLanguageHint(savedLang);
+    r.setLanguageHint(getLang());
     return r;
   };
 
-  const getLang = (): Language => {
-    const lang = vscode.workspace.getConfiguration("chainforge").get<string>("language") || "en";
-    return lang as Language;
+  // Workspace'e özgü anahtar (görev adımları/işlem geçmişi/sohbet modeli gibi proje bazlı verileri ayırmak için)
+  const wsKey = (): string => {
+    const folders = vscode.workspace.workspaceFolders;
+    return folders && folders.length > 0 ? folders[0].uri.fsPath : "__global__";
   };
+
+  // Sohbet modeli — proje bazlı (ChatStore ile aynı desende)
+  const getChatModel = (): string => context.globalState.get<string>(`chainforge.chatModel.${wsKey()}`) || "__auto_free__";
+  const saveChatModel = (model: string) => context.globalState.update(`chainforge.chatModel.${wsKey()}`, model);
 
   const onSaveConfig = async (newConfig: ChainConfig) => {
     await configManager!.saveConfig(newConfig);
@@ -121,7 +258,14 @@ export async function activate(context: vscode.ExtensionContext) {
 
   const onActivateLicense = async (key: string): Promise<{ success: boolean; error?: string }> => {
     const result = await licenseManager!.activateLicense(key);
-    if (result.valid) router?.setProStatus(true);
+    if (result.valid) {
+      router?.setProStatus(true);
+      telemetry?.record({ type: "feature", name: "pro_activated" });
+      // Satın alan herkese görünür, samimi bir teşekkür — sessizce geçmesin
+      vscode.window.showInformationMessage(
+        "🎉 ChainForge Pro'ya hoş geldin! Bunu bağımsız geliştiren biri olarak, desteğin gerçekten çok kıymetli. Teşekkür ederim — Sencer 💙"
+      );
+    }
     return { success: result.valid, error: result.error };
   };
 
@@ -153,6 +297,11 @@ export async function activate(context: vscode.ExtensionContext) {
       () => configManager!.openConfigFile(),
       async (key) => {
         await vscode.workspace.getConfiguration("chainforge").update("openRouterKey", key, vscode.ConfigurationTarget.Global);
+        // ATTRIBUTION (anonim): bu kullanıcı OpenRouter key bağladı — key ASLA gönderilmez,
+        // sadece olay + anonim oturum ID. ChainForge'un OpenRouter'a getirdiği kullanıcı kanıtı.
+        if (typeof key === "string" && key.startsWith("sk-or-")) {
+          telemetry?.record({ type: "feature", name: "openrouter_key_connected" });
+        }
       },
       onSaveConfig,
       onActivateLicense,
@@ -164,7 +313,14 @@ export async function activate(context: vscode.ExtensionContext) {
       !!vscode.workspace.getConfiguration("chainforge").get<string>("openRouterKey"),
       telemetry?.getConsent() || "ask",
       () => chatStore!.get(),   // proje bazlı geçmiş sohbet (canlı)
-      chatStore!.summary()      // ayarlar için özet
+      chatStore!.summary(),     // ayarlar için özet
+      vscode.workspace.getConfiguration("chainforge").get<string[]>("customInstructions") || [],
+      saveLang,                 // dil → globalState (workspace bağımsız)
+      getChatModel(),           // sohbet modeli → proje bazlı
+      saveChatModel,
+      context.globalState.get<string[]>(`chainforge.lastTaskSteps.${wsKey()}`, []),
+      context.globalState.get<any[]>(`chainforge.opHistory.${wsKey()}`, []),
+      () => liveFreeModelIds
     );
     return chainPanel;
   };
@@ -174,6 +330,81 @@ export async function activate(context: vscode.ExtensionContext) {
     // Sadece view'a focus et — WebviewViewProvider halleder
     await vscode.commands.executeCommand("chainforgeView.focus");
   });
+
+  // Kenar çubuğundaki (bazen dar kalan) görünümün alternatifi: aynı paneli büyük bir editör
+  // sekmesinde açar. Aynı chainPanel örneğini kullanır — tüm durum (config/isPro/vs.) ortak.
+  let fullViewPanel: vscode.WebviewPanel | undefined;
+  const openFullView = vscode.commands.registerCommand("chainforge.openFullView", async () => {
+    if (fullViewPanel) { fullViewPanel.reveal(); return; }
+    fullViewPanel = vscode.window.createWebviewPanel(
+      "chainforgeFullView", "ChainForge", vscode.ViewColumn.One,
+      { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [context.extensionUri] }
+    );
+    fullViewPanel.iconPath = vscode.Uri.joinPath(context.extensionUri, "icon-activitybar.svg");
+    // NOT: chainPanel henüz oluşmamış olabilir (createPanel() async) — panelPromise'ı
+    // bekleyerek, sidebar view'ın kendisinin yaptığı gibi güvenli şekilde erişiyoruz.
+    const panel = await panelPromise;
+    panel.attachWebviewPanel(fullViewPanel);
+    fullViewPanel.onDidDispose(() => { fullViewPanel = undefined; });
+  });
+
+  // Editörde seçili koda sağ-tık ile doğrudan agent görevi başlatma — panele gitme sürtünmesini
+  // kaldırır. Seçim yoksa dosyanın tamamı bağlam olarak eklenir.
+  const agentTaskFromSelection = vscode.commands.registerCommand("chainforge.agentTaskFromSelection", async () => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) { vscode.window.showErrorMessage("ChainForge: Açık bir dosya yok."); return; }
+    const selection = editor.selection;
+    const selectedText = selection && !selection.isEmpty ? editor.document.getText(selection) : "";
+    const relPath = vscode.workspace.workspaceFolders
+      ? vscode.workspace.asRelativePath(editor.document.uri, false)
+      : editor.document.fileName;
+
+    const instruction = await vscode.window.showInputBox({
+      prompt: selectedText ? `Seçili kodla (${relPath}) ne yapmak istiyorsun?` : `${relPath} ile ne yapmak istiyorsun?`,
+      placeHolder: "Örn: bu fonksiyona hata yönetimi ekle",
+    });
+    if (!instruction) return;
+
+    const contextBlock = selectedText
+      ? `\n\nDosya: ${relPath}\nSeçili kod:\n\`\`\`\n${selectedText}\n\`\`\``
+      : `\n\nDosya: ${relPath}`;
+    const presetPrompt = instruction + contextBlock;
+    await vscode.commands.executeCommand("chainforge.agentTask", presetPrompt, true, undefined, getLang());
+  });
+
+  // Problems panelindeki (derleyici/linter) hatalara doğrudan "ChainForge ile düzelt" hızlı
+  // düzeltmesi ekler — Denetmen'in ayrı tam-tarama akışından bağımsız, TEK bir tanıya odaklı.
+  const fixDiagnostic = vscode.commands.registerCommand(
+    "chainforge.fixDiagnostic",
+    async (uri: vscode.Uri, diag: vscode.Diagnostic) => {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const startLine = Math.max(0, diag.range.start.line - 3);
+      const endLine = Math.min(doc.lineCount - 1, diag.range.end.line + 3);
+      const contextCode = doc.getText(new vscode.Range(startLine, 0, endLine, doc.lineAt(endLine).text.length));
+      const relPath = vscode.workspace.workspaceFolders ? vscode.workspace.asRelativePath(uri, false) : uri.fsPath;
+      const presetPrompt = `Şu hatayı düzelt: "${diag.message}" (${relPath}, satır ${diag.range.start.line + 1})\n\nİlgili kod:\n\`\`\`\n${contextCode}\n\`\`\``;
+      await vscode.commands.executeCommand("chainforge.agentTask", presetPrompt, true, undefined, getLang());
+    }
+  );
+  const codeActionProvider = vscode.languages.registerCodeActionsProvider(
+    { scheme: "file" },
+    {
+      provideCodeActions(document, _range, ctx) {
+        return ctx.diagnostics
+          .filter(d => d.severity === vscode.DiagnosticSeverity.Error || d.severity === vscode.DiagnosticSeverity.Warning)
+          .map(diag => {
+            const action = new vscode.CodeAction(
+              `ChainForge ile düzelt: ${diag.message.slice(0, 60)}`,
+              vscode.CodeActionKind.QuickFix
+            );
+            action.command = { command: "chainforge.fixDiagnostic", title: "ChainForge ile düzelt", arguments: [document.uri, diag] };
+            action.diagnostics = [diag];
+            return action;
+          });
+      },
+    },
+    { providedCodeActionKinds: [vscode.CodeActionKind.QuickFix] }
+  );
 
   const runTask = vscode.commands.registerCommand("chainforge.runTask", async () => {
     if (!router) { vscode.window.showErrorMessage("ChainForge: Önce yapılandırın."); return; }
@@ -232,10 +463,23 @@ export async function activate(context: vscode.ExtensionContext) {
       activeChatAbort = new AbortController();
       const signal = activeChatAbort.signal;
       // AI'ya yalnızca user/assistant rolleri gider — "info" gibi UI notları API'yi bozar
-      const trimmed = history.filter(m => m.role === "user" || m.role === "assistant").slice(-20);
+      // Token taşmasını önlemek için: toplam karakter ~60k altında kalacak şekilde eski mesajları kırp
+      const clean = history.filter(m => m.role === "user" || m.role === "assistant");
+      let trimmed: { role: "user" | "assistant"; content: string }[] = [];
+      let charCount = 0;
+      for (let i = clean.length - 1; i >= 0; i--) {
+        charCount += clean[i].content.length;
+        if (charCount > 60000) break;
+        trimmed.unshift(clean[i]);
+      }
+      if (trimmed.length === 0 && clean.length > 0) trimmed = clean.slice(-1); // en azından son mesaj
 
       // PROJE FARKINDALIĞI — dosyaları DOĞRUDAN okur (açık olmaları gerekmez)
       let systemPrompt = getChatSystemPrompt(lang || "en");
+      const customInstructions = await getCustomInstructions();
+      if (customInstructions) {
+        systemPrompt += `\n\n[TALİMATLAR]\n${customInstructions}`;
+      }
       if (vscode.workspace.workspaceFolders) {
         try {
           const scanner = new WorkspaceScanner();
@@ -288,22 +532,35 @@ export async function activate(context: vscode.ExtensionContext) {
           }
         }
 
-        // 2) Ücretsiz model(ler) — seçili model başarısızsa diğer ücretsizlere düş
+        // 2a) Otomatik seçili ve routing agent varsa → önce router'ı(ları) dene
+        if (modelId === "__auto_free__") {
+          const routingKeys = router.findAllAgentsByRole("routing");
+          for (const rKey of routingKeys) {
+            if (signal.aborted) { sendToPanel({ command: "chatCancelled" }); return; }
+            const rName = config?.agents[rKey]?.name || rKey;
+            sendToPanel({ command: "chatTrying", model: rName });
+            const rResult = await router.runFromAgent(rKey, "", false, trimmed);
+            if (signal.aborted) { sendToPanel({ command: "chatCancelled" }); return; }
+            if (rResult.success && rResult.content.trim()) {
+              finishChat(true, rResult.content, rResult.usedModel, rResult.usage, undefined, sendToPanel);
+              return;
+            }
+          }
+        }
+
+        // 2b) Ücretsiz model(ler) — seçili model başarısızsa diğer ücretsizlere düş
         const isSingleChoice = modelId !== "__auto_free__" && !modelId.startsWith("agent:");
         const chosenLabel = isSingleChoice ? shortModel(modelId) : "";
+        const effectiveFallbackChain = filterAliveChain(FREE_FALLBACK_CHAIN, liveFreeModelIds);
         const tryModels = (modelId === "__auto_free__" || modelId.startsWith("agent:"))
-          ? FREE_FALLBACK_CHAIN
-          : [modelId, ...FREE_FALLBACK_CHAIN.filter(m => m !== modelId)]; // seçili önce, sonra yedekler
-        const userLabel = (lang === "tr") ? "Kullanıcı" : "User";
-        const asstLabel = (lang === "tr") ? "Asistan" : "Assistant";
-        const convo = trimmed.map(m => `${m.role === "user" ? userLabel : asstLabel}: ${m.content}`).join("\n");
+          ? effectiveFallbackChain
+          : [modelId, ...effectiveFallbackChain.filter(m => m !== modelId)]; // seçili önce, sonra yedekler
         let lastErr = "";
         for (let i = 0; i < tryModels.length; i++) {
           if (signal.aborted) { sendToPanel({ command: "chatCancelled" }); return; }
           const model = tryModels[i];
-          // CANLI: o an gerçekten denenen modeli panele bildir
           sendToPanel({ command: "chatTrying", model: shortModel(model) });
-          const r = await router.callDirect(model, systemPrompt, convo, false, signal);
+          const r = await router.callDirect(model, systemPrompt, "", false, signal, trimmed);
           if (signal.aborted) { sendToPanel({ command: "chatCancelled" }); return; }
           if (r.success && r.content.trim()) {
             const tokens = r.usage?.totalTokens || 0;
@@ -319,9 +576,10 @@ export async function activate(context: vscode.ExtensionContext) {
           lastErr = r.error || "boş yanıt";
         }
         sendToPanel({ command: "chatReply", data: { success: false, error: simplifyError(lastErr) } });
-        telemetry?.recordError("chat", lastErr);
+        telemetry?.recordError("chat", lastErr, undefined, { tool: "chat/freeModel" });
       } catch (err: any) {
         sendToPanel({ command: "chatReply", data: { success: false, error: simplifyError(err?.message || "") } });
+        telemetry?.recordError("chat_crash", err?.message || "", undefined, { tool: "chat", err });
       }
 
       function finishChat(ok: boolean, content: string, model: string, usage: any, error: string | undefined, send: any) {
@@ -330,7 +588,7 @@ export async function activate(context: vscode.ExtensionContext) {
           telemetry?.record({ type: "feature", name: "chat", success: true, model });
         } else {
           send({ command: "chatReply", data: { success: false, error: simplifyError(error || "") } });
-          telemetry?.recordError("chat", error || "", model);
+          telemetry?.recordError("chat", error || "", model, { tool: "chat/agent" });
         }
       }
     }
@@ -350,8 +608,14 @@ export async function activate(context: vscode.ExtensionContext) {
     const log = (m: string) => output.appendLine(m);
 
     const scanner = new WorkspaceScanner();
-    const changeLogger = new ChangeLogger();
-    const inspector = new Inspector(router, scanner, changeLogger, context, log);
+    const changeLogger = new ChangeLogger(context);
+    const inspector = new Inspector(router, scanner, changeLogger, context, log, undefined, (persistentPaths) => {
+      vscode.window.showWarningMessage(`Denetmen: ${persistentPaths.length} dosyada kalıcı hata var. Postacı düzeltsin mi?`, "Evet, Düzelt", "Hayır").then(choice => {
+        if (choice === "Evet, Düzelt") {
+          vscode.commands.executeCommand("chainforge.fixErrors", log);
+        }
+      });
+    });
 
     await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Notification, title: "ChainForge Denetmen...", cancellable: false },
@@ -361,7 +625,6 @@ export async function activate(context: vscode.ExtensionContext) {
           // Tek rapor dosyasına yaz
           await inspector.writeInspectionReport(r.results, { checked: r.checked, errors: r.errors, clean: r.clean });
           log(`\n✅ Denetim tamamlandı: ${r.checked} dosya, ${r.errors} hatalı, ${r.clean} temiz.`);
-          log(`   Rapor: .chainforge/logs/inspections/rapor_*.txt`);
           vscode.window.showInformationMessage(`Denetmen: ${r.checked} dosya kontrol edildi, ${r.errors} hatalı.`);
         } catch (err: any) {
           log(`\n❌ Hata: ${err?.message}`);
@@ -387,7 +650,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (config) router.updateConfig(config);
 
       const scanner = new WorkspaceScanner();
-      const changeLogger = new ChangeLogger();
+      const changeLogger = new ChangeLogger(context);
 
       // Panel ilerleme bildirimi
       const onProgress = (checked: number, total: number, currentFile: string) => {
@@ -398,7 +661,9 @@ export async function activate(context: vscode.ExtensionContext) {
       const output = vscode.window.createOutputChannel("ChainForge Denetmen");
       const log = (m: string) => { output.appendLine(m); };
 
-      const inspector = new Inspector(router, scanner, changeLogger, context, log, onProgress);
+      const inspector = new Inspector(router, scanner, changeLogger, context, log, onProgress, (persistentPaths) => {
+        sendToPanel({ command: "persistentErrors", data: { paths: persistentPaths, count: persistentPaths.length } });
+      });
 
       try {
         // Rapor dosyalarının zaman damgasına göre inkremental/tam tarama yapar
@@ -429,7 +694,7 @@ export async function activate(context: vscode.ExtensionContext) {
           },
         });
       } catch (err: any) {
-        telemetry?.recordError("inspect", err?.message || "");
+        telemetry?.recordError("inspect", err?.message || "", undefined, { tool: "inspector", err });
         sendToPanel({ command: "inspectionError", error: err?.message || "Denetim hatası" });
       }
     }
@@ -452,15 +717,16 @@ export async function activate(context: vscode.ExtensionContext) {
       if (config) router.updateConfig(config);
 
       const scanner = new WorkspaceScanner();
-      const changeLogger = new ChangeLogger();
+      const changeLogger = new ChangeLogger(context);
       const applier = new FileApplier();
       const codingTaskType = Object.keys(config?.tasks || {})[0] || "";
 
       sendToPanel({ command: "loading" });
 
       try {
-        // 1. En son denetim raporunu oku
-        const logDir = vscode.Uri.joinPath(vscode.workspace.workspaceFolders![0].uri, ".chainforge", "logs", "inspections");
+        // 1. En son denetim raporunu oku (Inspector ile aynı globalStorage konumu)
+        const wsKey2 = vscode.workspace.workspaceFolders![0].uri.fsPath.replace(/[:\\/]/g, "_").replace(/[^a-zA-Z0-9_\-]/g, "_").slice(-80);
+        const logDir = vscode.Uri.joinPath(context.globalStorageUri, "chainforge-logs", wsKey2, "inspections");
         let reportFiles: [string, vscode.FileType][] = [];
         try { reportFiles = await vscode.workspace.fs.readDirectory(logDir); } catch { /* yok */ }
 
@@ -579,12 +845,14 @@ TALİMATLAR:
           for (const change of applied) {
             await changeLogger.log(change, "postman-fix", router.getConfig().agents[codingTaskType]?.model || "?", "Denetmen hatalarının düzeltilmesi");
           }
+          if (applied.length > 0) await pushAppliedBatch(context, applied);
 
           sendToPanel({
             command: "result",
             data: {
               success: true,
               content: `\n✅ ${applied.length} dosya düzeltildi, ${skipped.length} atlandı.\n\nDeğişiklikler loglandı. Tekrar "Dosyaları Tara" ile kontrol edebilirsiniz.`,
+              revertible: applied.length > 0,
             },
           });
 
@@ -605,7 +873,7 @@ TALİMATLAR:
   // Denetmen checkpoint sıfırla (sonraki kontrol tüm dosyaları tarar)
   const inspectReset = vscode.commands.registerCommand("chainforge.inspectReset", async () => {
     const scanner = new WorkspaceScanner();
-    const changeLogger = new ChangeLogger();
+    const changeLogger = new ChangeLogger(context);
     if (router) {
       const inspector = new Inspector(router, scanner, changeLogger, context, () => {});
       inspector.resetCheckpoint();
@@ -638,8 +906,10 @@ TALİMATLAR:
       });
       if (!rawPrompt) return;
 
-      // Seçilen dile göre yanıt dili talimatını ekle
+      // Seçilen dile göre yanıt dili talimatını ekle + Pro: özel talimatlar
+      const customInstructions = await getCustomInstructions();
       const userPrompt = rawPrompt + "\n\n[" + getLanguageInstruction(lang) + "]"
+        + (customInstructions ? `\n\n[TALİMATLAR]\n${customInstructions}` : "")
 
       const config = await configManager!.loadConfig();
       if (config) router.updateConfig(config);
@@ -649,27 +919,57 @@ TALİMATLAR:
       output.appendLine(`\n[${new Date().toLocaleString("tr-TR")}] ▶ ${userPrompt}`);
       output.appendLine(`   Mod: ${applyFiles ? "Dosyalara uygula" : "Sadece göster"}\n`);
       const steps: string[] = [];
-      const log = (m: string) => { output.appendLine(m); steps.push(m); };
+      const log = (m: string) => {
+        output.appendLine(m);
+        steps.push(m);
+        sendToPanel?.({ command: "agentStep", step: m });
+      };
+      const saveSteps = () => {
+        const key = `chainforge.lastTaskSteps.${wsKey()}`;
+        context.globalState.update(key, steps.slice(-200));
+      };
+      const saveOperationHistory = (summary: string, model: string, files: string[], costUsd?: number) => {
+        const key = `chainforge.opHistory.${wsKey()}`;
+        const history = context.globalState.get<any[]>(key, []);
+        history.push({ ts: new Date().toISOString(), prompt: rawPrompt.slice(0, 120), summary, model, files, costUsd });
+        if (history.length > 50) history.splice(0, history.length - 50);
+        context.globalState.update(key, history);
+      };
+
+      // İptal kontrolörü — kullanıcı durdurursa orchestrator'ın sonucu görmezden gelinir
+      activeAgentAbort = new AbortController();
+      const agentSignal = activeAgentAbort.signal;
 
       const scanner = new WorkspaceScanner();
-      const changeLogger = new ChangeLogger();
-      const orchestrator = new Orchestrator(router, scanner, log, undefined, changeLogger);
+      const changeLogger = new ChangeLogger(context);
+      const codeIndexStore = new CodeIndexStore(context);
+      const orchestrator = new Orchestrator(router, scanner, log, undefined, changeLogger, codeIndexStore);
       const applier = new FileApplier();
       const codingTaskType = config ? Object.keys(config.tasks)[0] || "" : "";
 
       const t0 = Date.now();
+      activeTaskCost = { active: true, total: 0 }; // bu görevin AI çağrılarının GERÇEK toplam maliyetini izle
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: "ChainForge çalışıyor...", cancellable: false },
         async () => {
           try {
             const result = await orchestrator.run(userPrompt, codingTaskType);
+            if (agentSignal.aborted) {
+              // kullanıcı iptal ettiyse sonucu görmezden gel ama paneli "meşgul değil" durumuna döndür
+              sendToPanel?.({ command: "result", data: { success: false, error: "İptal edildi." } });
+              return;
+            }
             if (!result.success) {
               log(`\n❌ Hata: ${result.error}`);
-              telemetry?.recordError("agentTask", result.error || "", result.codingModel);
+              saveSteps();
+              telemetry?.recordError("agentTask", result.error || "", result.codingModel, { tool: "orchestrator" });
               sendToPanel?.({ command: "result", data: { success: false, error: result.error } });
               return;
             }
             telemetry?.record({ type: "feature", name: "agentTask", success: true, durationMs: Date.now() - t0, model: result.codingModel, meta: { applyFiles, changeCount: result.changes.length } });
+            if (result.flowEvents && result.flowEvents.length > 0) {
+              telemetry?.recordFlow(result.flowEvents, result.codingModel, rawPrompt.slice(0, 100));
+            }
             if (result.changes.length === 0) {
               log("\n⚠ Dosya değişikliği üretilmedi.");
               sendToPanel?.({ command: "result", data: { success: true, content: steps.join("\n") + "\n\n" + (result.rawResponse || ""), usedAgent: result.codingAgent, usedModel: result.codingModel, attempts: result.attempts } });
@@ -682,18 +982,52 @@ TALİMATLAR:
               displayContent += `\n═══ ${c.filePath} (${c.action}) ═══\n${c.newContent}\n`;
             }
 
+            let revertible = false;
             if (applyFiles) {
               // Diff onayı + uygula + logla
               const { applied, skipped } = await applier.applyBatch(result.changes);
               for (const change of applied) {
                 await changeLogger.log(change, result.codingAgent, result.codingModel, result.plan?.intent || userPrompt);
               }
+              if (applied.length > 0) { await pushAppliedBatch(context, applied); revertible = true; }
               log(`\n✅ ${applied.length} dosya uygulandı, ${skipped.length} atlandı.`);
-              log(`   Loglar: .chainforge/logs/changes/`);
-              vscode.window.showInformationMessage(`ChainForge: ${applied.length} dosya güncellendi.`);
-              displayContent = steps.join("\n");
+              const logDirPath = changeLogger.getLogDir();
+              if (logDirPath) log(`   Loglar: ${logDirPath}`);
+              vscode.window.showInformationMessage(`ChainForge: ${applied.length} dosya güncellendi.`, "Logları Göster", "Commit Mesajı Oluştur").then(async choice => {
+                if (choice === "Logları Göster" && logDirPath) {
+                  vscode.commands.executeCommand("revealFileInOS", vscode.Uri.file(logDirPath));
+                } else if (choice === "Commit Mesajı Oluştur") {
+                  const msg = await generateCommitMessage(applied, result.plan?.intent || userPrompt);
+                  if (msg) {
+                    await vscode.env.clipboard.writeText(msg);
+                    vscode.window.showInformationMessage(`Commit mesajı panoya kopyalandı:\n"${msg}"`);
+                  } else {
+                    vscode.window.showWarningMessage("ChainForge: Commit mesajı oluşturulamadı.");
+                  }
+                }
+              });
+
+              // Tamamlanma özeti
+              const summaryLines: string[] = [];
+              if (result.plan?.intent) summaryLines.push(`**Görev:** ${result.plan.intent}`);
+              if (result.codingModel) summaryLines.push(`**Model:** ${result.codingModel}`);
+              if (applied.length > 0) {
+                summaryLines.push(`\n**Uygulanan dosyalar (${applied.length}):**`);
+                for (const c of applied) summaryLines.push(`• \`${c.filePath}\` — ${c.action === "create" ? "oluşturuldu" : c.action === "delete" ? "silindi" : "güncellendi"}`);
+              }
+              if (skipped.length > 0) summaryLines.push(`\n**Atlanan (${skipped.length}):** ${skipped.map(c => c.filePath).join(", ")}`);
+              const taskCost = activeTaskCost?.total || 0;
+              if (taskCost > 0) summaryLines.push(`\n**Gerçek maliyet:** $${taskCost.toFixed(4)}`);
+              displayContent = steps.join("\n") + "\n\n---\n" + summaryLines.join("\n");
             } else {
               log(`\n📄 ${result.changes.length} dosya üretildi (uygulanmadı — checkbox kapalı).`);
+            }
+
+            const taskCostForLog = activeTaskCost?.total || 0;
+            if (taskCostForLog > 0) log(`   💰 Bu görevin gerçek maliyeti: $${taskCostForLog.toFixed(4)}`);
+            saveSteps();
+            if (applyFiles && result.changes.length > 0) {
+              saveOperationHistory((result.plan?.intent || rawPrompt).slice(0, 200), result.codingModel, result.changes.map(c => c.filePath), taskCostForLog || undefined);
             }
 
             sendToPanel?.({
@@ -704,13 +1038,17 @@ TALİMATLAR:
                 usedAgent: result.codingAgent,
                 usedModel: result.codingModel,
                 attempts: result.attempts,
+                revertible,
               },
             });
           } catch (err: any) {
             log(`\n❌ Beklenmeyen hata: ${err?.message}`);
-            telemetry?.recordError("agentTask_crash", err?.message || "");
+            saveSteps();
+            telemetry?.recordError("agentTask_crash", err?.message || "", undefined, { tool: "orchestrator", err });
             sendToPanel?.({ command: "result", data: { success: false, error: err?.message } });
             vscode.window.showErrorMessage(`ChainForge hatası: ${err?.message}`);
+          } finally {
+            activeTaskCost = null; // sonraki (agent dışı) AI çağrıları bu göreve yanlışlıkla eklenmesin
           }
         }
       );
@@ -731,10 +1069,46 @@ TALİMATLAR:
     activeChatAbort?.abort();
   });
 
+  const cancelAgentTask = vscode.commands.registerCommand("chainforge.cancelAgentTask", () => {
+    activeAgentAbort?.abort();
+    activeAgentAbort = null;
+  });
+
+  // GERİ AL — diskteki geçmişten en son batch'i geri alır (LIFO). Free: tek adım. Pro: son 20 adıma kadar zincirleme.
+  const revertLastChange = vscode.commands.registerCommand("chainforge.revertLastChange", async (sendToPanel?: (payload: any) => void) => {
+    const store = new UndoStore(context);
+    const batch = await store.popLatest();
+    if (!batch || batch.length === 0) {
+      vscode.window.showInformationMessage("ChainForge: Geri alınacak bir değişiklik yok.");
+      return;
+    }
+    const answer = await vscode.window.showWarningMessage(
+      `${batch.length} dosyadaki değişiklik geri alınsın mı?`,
+      { modal: true },
+      "Evet, Geri Al"
+    );
+    if (answer !== "Evet, Geri Al") {
+      // Vazgeçildi — kaydı diske geri koy ki kaybolmasın
+      const isPro = (await licenseManager?.isPro()) || false;
+      await store.push(batch, isPro ? MAX_UNDO_HISTORY_PRO : 1);
+      return;
+    }
+    const applier = new FileApplier();
+    const { reverted, failed } = await applier.revertBatch(batch);
+    const hasMore = await store.hasAny();
+    if (failed.length > 0) {
+      vscode.window.showWarningMessage(`ChainForge: ${reverted} dosya geri alındı, ${failed.length} dosya geri alınamadı: ${failed.join(", ")}`);
+    } else {
+      vscode.window.showInformationMessage(`ChainForge: ${reverted} dosya geri alındı.${hasMore ? " (daha fazla adım geri alınabilir)" : ""}`);
+    }
+    sendToPanel?.({ command: "revertDone", data: { reverted, failed, hasMore } });
+  });
+
   // Sohbet temizle: scope "current" (bu proje) | "all" (tümü)
   const clearChat = vscode.commands.registerCommand("chainforge.clearChat", async (scope: string) => {
     if (scope === "all") await chatStore?.clearAll();
     else await chatStore?.clearCurrent();
+    chainPanel?.refreshView(); // panel yeniden yüklensin (sohbet + sayılar güncellensin)
   });
 
   const openUrl = vscode.commands.registerCommand("chainforge.openUrl", async (url: string) => {
@@ -742,6 +1116,10 @@ TALİMATLAR:
     try {
       const u = new URL(url);
       if (allowed.some(d => u.hostname === d || u.hostname.endsWith("." + d))) {
+        // ATTRIBUTION (anonim): kullanıcı OpenRouter'a yönlendirildi
+        if (u.hostname.endsWith("openrouter.ai")) {
+          telemetry?.record({ type: "feature", name: "openrouter_link_click" });
+        }
         await vscode.env.openExternal(vscode.Uri.parse(url));
       }
     } catch {}
@@ -761,7 +1139,7 @@ TALİMATLAR:
   };
 
   context.subscriptions.push(
-    openPanel, runTask, configure, openUrl, agentTask, chat, cancelChat, inspect, inspectFromPanel, fixErrors, inspectReset, setTelemetry, saveChat, clearChat,
+    openPanel, openFullView, agentTaskFromSelection, fixDiagnostic, codeActionProvider, runTask, configure, openUrl, agentTask, chat, cancelChat, cancelAgentTask, revertLastChange, inspect, inspectFromPanel, fixErrors, inspectReset, setTelemetry, saveChat, clearChat,
     vscode.window.registerWebviewViewProvider(AIChainPanel.viewType, webviewProvider, {
       webviewOptions: { retainContextWhenHidden: true }
     })
@@ -776,11 +1154,9 @@ TALİMATLAR:
 
   vscode.workspace.onDidChangeConfiguration(async (e) => {
     if (e.affectsConfiguration("chainforge")) {
-      // Dil değişikliğini router'a ilet
-      if (e.affectsConfiguration("chainforge.language")) {
-        const newLang = vscode.workspace.getConfiguration("chainforge").get<string>("language") || "en";
-        router?.setLanguageHint(newLang);
-      }
+      // NOT: Dil artık panelden seçilip globalState'te tutuluyor (saveLang() zaten
+      // router.setLanguageHint()'i orada çağırıyor) — burada ayrı bir "chainforge.language"
+      // VS Code ayarı YOK, o yüzden burada tekrar okumaya gerek yok (kaldırılan hayalet ayar).
       const newConfig = await configManager!.loadConfig();
       if (newConfig) {
         if (!router) router = makeRouter(newConfig);

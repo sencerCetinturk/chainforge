@@ -102,6 +102,28 @@ export function validateFallback(fallback: string, agents: { [key: string]: any 
   return { valid: true };
 }
 
+// AI'nin ürettiği (agent/postacı) dosya değişikliği yollarını doğrular.
+// Workspace DIŞINA çıkan hiçbir yola izin vermez — path traversal koruması.
+export function validateRelativeFilePath(filePath: string): ValidationResult {
+  if (!filePath || filePath.trim() === "") {
+    return { valid: false, error: "Dosya yolu boş olamaz" };
+  }
+  // Null byte / kontrol karakteri
+  if (/\0/.test(filePath)) {
+    return { valid: false, error: "Dosya yolunda geçersiz karakter var" };
+  }
+  // Mutlak yol: "/...", "\...", sürücü harfi ("C:\", "D:/"), UNC ("\\server\...") veya "~"
+  if (/^[\/\\]/.test(filePath) || /^[a-zA-Z]:[\/\\]/.test(filePath) || filePath.startsWith("~")) {
+    return { valid: false, error: "Mutlak dosya yoluna izin verilmiyor" };
+  }
+  // Windows/POSIX ayrımı olmadan segmentlere böl, ".." kontrolü yap
+  const segments = filePath.split(/[\/\\]/);
+  if (segments.some(s => s === "..")) {
+    return { valid: false, error: "Dosya yolu workspace dışına çıkamaz (..)" };
+  }
+  return { valid: true };
+}
+
 export function validateFilename(filename: string): ValidationResult {
   if (!filename || filename.trim() === "") return { valid: false, error: "Dosya adı boş olamaz" };
   // Path traversal koruması

@@ -4,35 +4,53 @@
 //       "limited" → ücretsiz ama düşük günlük/dakika limiti (yoğun kullanımda biter)
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.FREE_FALLBACK_CHAIN = exports.FREE_MODELS = void 0;
+exports.filterAliveModels = filterAliveModels;
+exports.filterAliveChain = filterAliveChain;
 exports.isFreeModel = isFreeModel;
 exports.getFreeModel = getFreeModel;
+// NOT (2026-08-31): OpenRouter'ın :free katalogu sık değişiyor — burada listelenen ID'ler
+// openrouter.ai/api/v1/models canlı listesine karşı doğrulanmıştır. Bu liste periyodik
+// olarak (ör. birkaç ayda bir) yeniden doğrulanmalı, aksi halde modeller sessizce ölebilir.
 exports.FREE_MODELS = [
     // — Kod odaklı —
-    { id: "qwen/qwen3-coder:free", label: "Qwen3 Coder", tier: "free", goodFor: "Kod yazma" },
-    { id: "deepseek/deepseek-chat-v3-0324:free", label: "DeepSeek V3", tier: "free", goodFor: "Kod & mantık" },
+    { id: "cohere/north-mini-code:free", label: "North Mini Code", tier: "free", goodFor: "Kod yazma" },
+    { id: "minimax/minimax-m3:free", label: "MiniMax M3", tier: "free", goodFor: "Kod & mantık" },
     // — Güçlü genel —
-    { id: "openai/gpt-oss-120b:free", label: "GPT-OSS 120B", tier: "free", goodFor: "Güçlü genel" },
-    { id: "meta-llama/llama-3.3-70b-instruct:free", label: "Llama 3.3 70B", tier: "free", goodFor: "Genel amaçlı" },
-    { id: "nvidia/nemotron-3-super-120b-a12b:free", label: "Nemotron Super 120B", tier: "free", goodFor: "Güçlü akıl yürütme" },
-    { id: "qwen/qwen3-next-80b-a3b-instruct:free", label: "Qwen3 Next 80B", tier: "free", goodFor: "Genel amaçlı" },
-    { id: "nousresearch/hermes-3-llama-3.1-405b:free", label: "Hermes 3 405B", tier: "limited", goodFor: "Çok güçlü, yaratıcı" },
+    { id: "nvidia/nemotron-3-ultra-550b-a55b:free", label: "Nemotron Ultra 550B", tier: "free", goodFor: "Güçlü genel" },
+    { id: "z-ai/glm-5.2:free", label: "GLM 5.2", tier: "free", goodFor: "Güçlü akıl yürütme" },
+    { id: "nvidia/nemotron-3-super-120b-a12b:free", label: "Nemotron Super 120B", tier: "free", goodFor: "Genel amaçlı" },
     // — Hızlı —
-    { id: "z-ai/glm-4.5-air:free", label: "GLM 4.5 Air", tier: "free", goodFor: "Hızlı genel" },
-    { id: "openai/gpt-oss-20b:free", label: "GPT-OSS 20B", tier: "free", goodFor: "Hızlı, dengeli" },
     { id: "google/gemma-4-31b-it:free", label: "Gemma 4 31B", tier: "limited", goodFor: "Hızlı yanıt" },
-    { id: "moonshotai/kimi-k2.6:free", label: "Kimi K2.6", tier: "limited", goodFor: "Uzun bağlam" },
+    { id: "google/gemma-4-26b-a4b-it:free", label: "Gemma 4 26B", tier: "free", goodFor: "Hızlı, dengeli" },
+    { id: "minimax/minimax-m2.7:free", label: "MiniMax M2.7", tier: "limited", goodFor: "Genel amaçlı" },
     // — Hafif / çok hızlı —
-    { id: "meta-llama/llama-3.2-3b-instruct:free", label: "Llama 3.2 3B", tier: "limited", goodFor: "Çok hızlı, basit" },
-    { id: "nvidia/nemotron-nano-9b-v2:free", label: "Nemotron Nano 9B", tier: "limited", goodFor: "Hafif görevler" },
-    { id: "qwen/qwen-2.5-72b-instruct:free", label: "Qwen 2.5 72B", tier: "limited", goodFor: "Genel amaçlı" },
+    { id: "liquid/lfm-2.5-2.6b:free", label: "LFM2.5 2.6B", tier: "limited", goodFor: "Çok hızlı, basit" },
+    // — Uzun bağlam —
+    { id: "thinkingmachines/inkling:free", label: "Inkling", tier: "limited", goodFor: "Uzun bağlam" },
+    { id: "dots-studio/dots-3-note-preview:free", label: "Dots3 Note Preview", tier: "limited", goodFor: "Uzun bağlam" },
 ];
 // Postacı/koordinatör için varsayılan ücretsiz zincir (sırayla denenir)
 exports.FREE_FALLBACK_CHAIN = [
-    "qwen/qwen3-coder:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "z-ai/glm-4.5-air:free",
-    "openai/gpt-oss-120b:free",
+    "cohere/north-mini-code:free",
+    "minimax/minimax-m3:free",
+    "z-ai/glm-5.2:free",
+    "google/gemma-4-31b-it:free",
 ];
+// Canlı katalog kontrolü (modelCatalog.ts) sonucuna göre statik listeleri süzer. liveIds
+// null/boşsa (ağ hatası ya da henüz çekilmediyse) statik listenin TAMAMI güvenle döner —
+// bu fonksiyon davranışı asla daha kötü hale getirmez, sadece iyileştirir.
+function filterAliveModels(models, liveIds) {
+    if (!liveIds || liveIds.size === 0)
+        return models;
+    const alive = models.filter(m => liveIds.has(m.id.toLowerCase()));
+    return alive.length > 0 ? alive : models; // hepsi ölü görünüyorsa (şüpheli) statik listeye güven
+}
+function filterAliveChain(chain, liveIds) {
+    if (!liveIds || liveIds.size === 0)
+        return chain;
+    const alive = chain.filter(id => liveIds.has(id.toLowerCase()));
+    return alive.length > 0 ? alive : chain;
+}
 function isFreeModel(modelId) {
     return modelId.includes(":free") || exports.FREE_MODELS.some(m => m.id === modelId);
 }
