@@ -21,6 +21,11 @@ ChainForge isn't just a chat sidebar. It's a small pipeline of AI agents that ta
 - **💰 Cost tracking** — every AI call's token usage and estimated cost (live OpenRouter pricing) is logged; see a monthly breakdown by model right in the panel.
 - **🌍 7 Languages** — EN, TR, DE, FR, ES, JA, ZH — full interface and AI response language.
 - **🔒 Privacy-first telemetry** — fully opt-in; if enabled, only anonymous feature/error data is collected — never your code, prompts, or API key.
+- **✂️ Cost-optimized editing** — for existing files, Postacı sends the coding model only the relevant code block instead of the whole file (verified byte-for-byte against the source, with an automatic full-file fallback whenever it can't be verified). Measured **78% lower cost per task** on a real 400+ line file.
+- **📑 Full-tab view** — open ChainForge in a large editor tab instead of the sidebar, when you want more room.
+- **🖱 Right-click quick tasks** — select code (or just place your cursor in a file) → right-click → "ChainForge: Run Task on Selection" — no need to open the panel first.
+- **💡 Quick-fix on errors** — a lightbulb on any compiler/linter diagnostic offers "Fix with ChainForge", scoped to that one error.
+- **🔄 Self-healing free tier** — the free-model list is checked against OpenRouter's live catalog every 24h, so it can't silently go stale.
 
 ---
 
@@ -63,14 +68,14 @@ ChainForge stores its agent/task setup in `.chainforge.json` in your workspace r
     },
     "fallback": {
       "name": "Fallback",
-      "model": "google/gemini-flash-1-5",
+      "model": "google/gemini-2.5-flash",
       "role": "fallback",
       "fallback": "supervisor",
       "maxRetries": 2
     },
     "supervisor": {
       "name": "Supervisor",
-      "model": "anthropic/claude-sonnet-4-5",
+      "model": "anthropic/claude-sonnet-4.5",
       "role": "supervisor",
       "maxRetries": 1
     }
@@ -94,8 +99,10 @@ ChainForge stores its agent/task setup in `.chainforge.json` in your workspace r
 | Bring your own API key **per agent** (any provider, not just OpenRouter) | — | ✓ |
 | Agent auto-edit tasks | ✓ | ✓ |
 | Denetmen / Postacı auto-fix loop | ✓ | ✓ |
-| Undo history for auto-edits | 1 step | **Unlimited (session)** |
+| Undo history for auto-edits | 1 step | **Up to 20 steps** |
 | Custom global instructions (your style, preferred libraries, conventions — applied to every chat & agent task) | — | ✓ |
+| Team-shared project instructions (`.chainforge/instructions.md`, committed to your repo) | — | ✓ |
+| Quick-setup presets (Free / Balanced / Powerful) | ✓ | ✓ |
 | Tasks | Unlimited | Unlimited |
 | Visual editor | ✓ | ✓ |
 | Cost & usage tracking | ✓ | ✓ |

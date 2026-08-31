@@ -2,7 +2,7 @@
   "name": "chainforge",
   "displayName": "ChainForge — Multi-Model AI Chat & Agents",
   "description": "AI coding assistant for VS Code. Chat, auto-edit files, and run a self-healing inspect/fix loop with 400+ models (GPT, Claude, Gemini, DeepSeek) via OpenRouter. Smart routing, automatic fallback, free-tier included.",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "publisher": "sencerCetinturk",
   "license": "MIT",
   "engines": {
@@ -79,12 +79,12 @@
       },
       {
         "command": "chainforge.openFullView",
-        "title": "ChainForge: Büyük Görünümde Aç (Editör Sekmesi)",
+        "title": "ChainForge: Open in Full View (Editor Tab)",
         "icon": "icon-activitybar.svg"
       },
       {
         "command": "chainforge.agentTaskFromSelection",
-        "title": "ChainForge: Seçili Kodla Görev Başlat"
+        "title": "ChainForge: Run Task on Selection"
       },
       {
         "command": "chainforge.runTask",

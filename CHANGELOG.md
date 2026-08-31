@@ -2,6 +2,13 @@
 
 All notable changes to ChainForge will be documented here.
 
+## [1.4.3] - 2026-08-31
+
+### Changed
+- README (Marketplace/Open VSX listing sayfası) 1.4.2'de eklenen özellikleri (blok-bazlı maliyet optimizasyonu + ölçülen %78 tasarruf, büyük görünüm, seçili koddan hızlı görev, quick-fix, kendini güncelleyen ücretsiz katman) ve güncel Pro tablosunu (paylaşılabilir proje talimatları, preset'ler, doğru geri-al limiti: 20) yansıtacak şekilde güncellendi.
+- Örnek `.chainforge.json` konfigürasyonundaki model ID'leri güncel/gerçek OpenRouter formatına düzeltildi.
+- Yeni komutların Command Palette başlıkları İngilizceye çevrildi (paketin geri kalanıyla tutarlılık için).
+
 ## [1.4.2] - 2026-08-31
 
 ### Added — Yeni özellikler (kullanıcı talebi üzerine, tek turda eklendi)
